@@ -27,7 +27,7 @@
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>SUFeedURL</key>
-    <string>REPLACE_WITH_APPCAST_URL</string>
+    <string>https://gist.githubusercontent.com/34-byte/6a5dacdb24a6bae85d003e906f5fa907/raw/appcast.xml</string>
     <key>SUPublicEDKey</key>
     <string>P9AXPluTwv6uB5JYvou3vFpB6d16Ov8zTbt5SHB9sEo=</string>
     <key>SUEnableAutomaticChecks</key>
