@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>TextRefiner Updates</title>
+    <description>TextRefiner changelog and updates</description>
+    <language>en</language>
+
+    <!-- Add new <item> entries at the top for each release -->
+    <item>
+      <title>Version 1.1.0</title>
+      <description><![CDATA[
+        <h3>What's New in 1.1.0</h3>
+        <ul>
+          <li>Custom hotkey configuration (Settings → Hotkey)</li>
+          <li>Refinement history — view your last 10 refinements</li>
+          <li>Model management — download, select, and delete models from the menu</li>
+          <li>Prompt Settings with history and revert</li>
+          <li>Launch on login toggle</li>
+          <li>In-app auto-updates</li>
+        </ul>
+      ]]></description>
+      <pubDate>Sat, 05 Apr 2026 12:00:00 +0000</pubDate>
+      <sparkle:version>11</sparkle:version>
+      <sparkle:shortVersionString>1.1.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <enclosure
+        url="REPLACE_WITH_GITHUB_RELEASE_ZIP_URL"
+        length="REPLACE_WITH_ZIP_SIZE_IN_BYTES"
+        type="application/octet-stream"
+        sparkle:edSignature="REPLACE_WITH_ED_SIGNATURE"
+      />
+    </item>
+
+  </channel>
+</rss>

@@ -1,0 +1,17 @@
+# Build artifacts
+TextRefiner/.build/
+TextRefiner/TextRefiner.app/
+TextRefiner/*.zip
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Claude Code
+.claude/
+.claude-flow/
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
