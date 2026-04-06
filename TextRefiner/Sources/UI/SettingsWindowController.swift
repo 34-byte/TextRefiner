@@ -13,10 +13,17 @@ final class SettingsWindowController {
     /// Called after the hotkey is saved — AppDelegate uses this to restart the event tap.
     var onHotkeyChanged: (() -> Void)?
 
+    /// Called when the user clicks "Replay Tutorial" — AppDelegate shows onboarding.
+    var onReplayTutorial: (() -> Void)?
+
+    /// Called when the typing indicator toggle changes. AppDelegate starts/stops TypingMonitor.
+    var onTypingIndicatorToggled: ((Bool) -> Void)?
+
     private var hotkeyButton: NSButton?
     private var warningLabel: NSTextField?
     private var resetButton: NSButton?
     private var launchOnLoginCheckbox: NSButton?
+    private var indicatorCheckbox: NSButton?
     private var rebuildButton: NSButton?
     private var buildStatusLabel: NSTextField?
     private var buildSpinner: NSProgressIndicator?
@@ -31,15 +38,20 @@ final class SettingsWindowController {
 
     func show() {
         if let existing = window {
-            // Refresh launch-on-login checkbox to reflect current state
+            // Refresh controls to reflect current state
             launchOnLoginCheckbox?.state = Self.isLaunchOnLoginEnabled ? .on : .off
+            indicatorCheckbox?.state = Self.isIndicatorEnabled ? .on : .off
             existing.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
         }
 
+        let isDevBuild = Bundle.main.bundleIdentifier == "com.textrefiner.app.dev"
+        // +22pt vs previous heights to accommodate the new typing indicator row
+        let windowHeight: CGFloat = isDevBuild ? 412 : 377
+
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 355),
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: windowHeight),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -62,15 +74,15 @@ final class SettingsWindowController {
         // --- Hotkey Section ---
 
         let sectionLabel = makeLabel("Hotkey", bold: true)
-        sectionLabel.frame = NSRect(x: 20, y: 305, width: 380, height: 20)
+        sectionLabel.frame = NSRect(x: 20, y: 340, width: 380, height: 20)
         contentView.addSubview(sectionLabel)
 
         let descLabel = makeLabel("Click the field below, then press your desired shortcut.")
-        descLabel.frame = NSRect(x: 20, y: 280, width: 380, height: 20)
+        descLabel.frame = NSRect(x: 20, y: 315, width: 380, height: 20)
         descLabel.textColor = .secondaryLabelColor
         contentView.addSubview(descLabel)
 
-        let btn = NSButton(frame: NSRect(x: 20, y: 243, width: 200, height: 28))
+        let btn = NSButton(frame: NSRect(x: 20, y: 278, width: 200, height: 28))
         btn.bezelStyle = .roundRect
         btn.title = HotkeyConfiguration.shared.displayString
         btn.target = self
@@ -78,7 +90,7 @@ final class SettingsWindowController {
         contentView.addSubview(btn)
         self.hotkeyButton = btn
 
-        let reset = NSButton(frame: NSRect(x: 228, y: 243, width: 120, height: 28))
+        let reset = NSButton(frame: NSRect(x: 228, y: 278, width: 120, height: 28))
         reset.bezelStyle = .roundRect
         reset.title = "Reset to Default"
         reset.target = self
@@ -87,7 +99,7 @@ final class SettingsWindowController {
         self.resetButton = reset
 
         let warning = makeLabel("")
-        warning.frame = NSRect(x: 20, y: 210, width: 380, height: 30)
+        warning.frame = NSRect(x: 20, y: 245, width: 380, height: 30)
         warning.textColor = .systemOrange
         warning.lineBreakMode = .byWordWrapping
         warning.maximumNumberOfLines = 2
@@ -98,54 +110,66 @@ final class SettingsWindowController {
 
         // --- Separator (Hotkey / General) ---
 
-        let separator1 = NSBox(frame: NSRect(x: 20, y: 190, width: 380, height: 1))
+        let separator1 = NSBox(frame: NSRect(x: 20, y: 225, width: 380, height: 1))
         separator1.boxType = .separator
         contentView.addSubview(separator1)
 
         // --- General Section ---
 
         let generalLabel = makeLabel("General", bold: true)
-        generalLabel.frame = NSRect(x: 20, y: 160, width: 380, height: 20)
+        generalLabel.frame = NSRect(x: 20, y: 195, width: 380, height: 20)
         contentView.addSubview(generalLabel)
 
         let loginCheckbox = NSButton(checkboxWithTitle: "Launch TextRefiner on login", target: self, action: #selector(toggleLaunchOnLogin))
-        loginCheckbox.frame = NSRect(x: 20, y: 135, width: 380, height: 18)
+        loginCheckbox.frame = NSRect(x: 20, y: 170, width: 380, height: 18)
         loginCheckbox.state = Self.isLaunchOnLoginEnabled ? .on : .off
         contentView.addSubview(loginCheckbox)
         self.launchOnLoginCheckbox = loginCheckbox
 
-        // --- Separator (General / Developer) ---
+        let indCheckbox = NSButton(checkboxWithTitle: "Show typing indicator", target: self, action: #selector(toggleIndicator))
+        indCheckbox.frame = NSRect(x: 20, y: 148, width: 380, height: 18)
+        indCheckbox.state = Self.isIndicatorEnabled ? .on : .off
+        contentView.addSubview(indCheckbox)
+        self.indicatorCheckbox = indCheckbox
 
-        let separator = NSBox(frame: NSRect(x: 20, y: 112, width: 380, height: 1))
-        separator.boxType = .separator
-        contentView.addSubview(separator)
+        let tutorialBtn = NSButton(frame: NSRect(x: 20, y: 113, width: 170, height: 28))
+        tutorialBtn.bezelStyle = .roundRect
+        tutorialBtn.title = "Replay Tutorial..."
+        tutorialBtn.target = self
+        tutorialBtn.action = #selector(replayTutorial)
+        contentView.addSubview(tutorialBtn)
 
-        // --- Developer Section ---
+        // --- Developer Section (dev builds only) ---
+        if isDevBuild {
+            let separator = NSBox(frame: NSRect(x: 20, y: 112, width: 380, height: 1))
+            separator.boxType = .separator
+            contentView.addSubview(separator)
 
-        let devLabel = makeLabel("Developer", bold: true)
-        devLabel.frame = NSRect(x: 20, y: 82, width: 380, height: 20)
-        contentView.addSubview(devLabel)
+            let devLabel = makeLabel("Developer", bold: true)
+            devLabel.frame = NSRect(x: 20, y: 82, width: 380, height: 20)
+            contentView.addSubview(devLabel)
 
-        let rebuildBtn = NSButton(frame: NSRect(x: 20, y: 45, width: 170, height: 28))
-        rebuildBtn.bezelStyle = .roundRect
-        rebuildBtn.title = "Rebuild & Relaunch"
-        rebuildBtn.target = self
-        rebuildBtn.action = #selector(rebuildAndRelaunch)
-        contentView.addSubview(rebuildBtn)
-        self.rebuildButton = rebuildBtn
+            let rebuildBtn = NSButton(frame: NSRect(x: 20, y: 45, width: 170, height: 28))
+            rebuildBtn.bezelStyle = .roundRect
+            rebuildBtn.title = "Rebuild & Relaunch"
+            rebuildBtn.target = self
+            rebuildBtn.action = #selector(rebuildAndRelaunch)
+            contentView.addSubview(rebuildBtn)
+            self.rebuildButton = rebuildBtn
 
-        let spinner = NSProgressIndicator(frame: NSRect(x: 198, y: 49, width: 20, height: 20))
-        spinner.style = .spinning
-        spinner.controlSize = .small
-        spinner.isHidden = true
-        contentView.addSubview(spinner)
-        self.buildSpinner = spinner
+            let spinner = NSProgressIndicator(frame: NSRect(x: 198, y: 49, width: 20, height: 20))
+            spinner.style = .spinning
+            spinner.controlSize = .small
+            spinner.isHidden = true
+            contentView.addSubview(spinner)
+            self.buildSpinner = spinner
 
-        let statusLabel = makeLabel("")
-        statusLabel.frame = NSRect(x: 20, y: 15, width: 380, height: 20)
-        statusLabel.textColor = .secondaryLabelColor
-        contentView.addSubview(statusLabel)
-        self.buildStatusLabel = statusLabel
+            let statusLabel = makeLabel("")
+            statusLabel.frame = NSRect(x: 20, y: 15, width: 380, height: 20)
+            statusLabel.textColor = .secondaryLabelColor
+            contentView.addSubview(statusLabel)
+            self.buildStatusLabel = statusLabel
+        }
 
         self.window = w
         w.makeKeyAndOrderFront(nil)
@@ -251,6 +275,27 @@ final class SettingsWindowController {
         } else {
             warningLabel?.stringValue = ""
         }
+    }
+
+    // MARK: - Replay Tutorial
+
+    @objc private func replayTutorial() {
+        window?.close()
+        onReplayTutorial?()
+    }
+
+    // MARK: - Typing Indicator
+
+    private static var isIndicatorEnabled: Bool {
+        // Default to true when the key hasn't been written yet
+        guard UserDefaults.standard.object(forKey: TypingMonitor.enabledKey) != nil else { return true }
+        return UserDefaults.standard.bool(forKey: TypingMonitor.enabledKey)
+    }
+
+    @objc private func toggleIndicator() {
+        let enabled = indicatorCheckbox?.state == .on
+        UserDefaults.standard.set(enabled, forKey: TypingMonitor.enabledKey)
+        onTypingIndicatorToggled?(enabled)
     }
 
     // MARK: - Launch on Login

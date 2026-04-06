@@ -9,7 +9,7 @@ final class PromptSettingsWindowController {
 
     func show() {
         // If window already exists, just bring it to front
-        if let existing = window, existing.isVisible {
+        if let existing = window {
             existing.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -26,6 +26,7 @@ final class PromptSettingsWindowController {
         w.title = "Prompt Settings"
         w.contentViewController = NSHostingController(rootView: settingsView)
         w.contentMinSize = NSSize(width: 500, height: 450)
+        w.isReleasedWhenClosed = false
         w.center()
         w.makeKeyAndOrderFront(nil)
 

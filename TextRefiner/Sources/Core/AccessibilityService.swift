@@ -39,9 +39,12 @@ enum AccessibilityService {
             return true
         }
 
-        // Method 2: Fall back to the standard API
-        // This catches cases where the tap creation fails for non-permission reasons
-        return AXIsProcessTrusted()
+        // Method 2: Tap creation failed — treat as not trusted.
+        // AXIsProcessTrusted() is explicitly documented as unreliable on macOS Ventura+;
+        // using it here as a fallback would give a false answer with false confidence.
+        // If the tap cannot be created, permission is not working regardless of what
+        // the system database says.
+        return false
     }
 
     /// Prompts the user to grant Accessibility permission via System Settings.

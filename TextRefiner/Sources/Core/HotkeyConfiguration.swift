@@ -21,15 +21,17 @@ final class HotkeyConfiguration {
     // MARK: - Current Hotkey
 
     var keyCode: UInt16 {
-        let stored = UserDefaults.standard.integer(forKey: keyCodeKey)
-        // 0 means never saved — use default
-        return stored != 0 ? UInt16(stored) : Self.defaultKeyCode
+        guard UserDefaults.standard.object(forKey: keyCodeKey) != nil else {
+            return Self.defaultKeyCode
+        }
+        return UInt16(UserDefaults.standard.integer(forKey: keyCodeKey))
     }
 
     var modifierFlags: CGEventFlags {
-        let stored = UserDefaults.standard.integer(forKey: modifierFlagsKey)
-        // 0 means never saved — use default
-        return stored != 0 ? CGEventFlags(rawValue: UInt64(stored)) : Self.defaultModifierFlags
+        guard UserDefaults.standard.object(forKey: modifierFlagsKey) != nil else {
+            return Self.defaultModifierFlags
+        }
+        return CGEventFlags(rawValue: UInt64(UserDefaults.standard.integer(forKey: modifierFlagsKey)))
     }
 
     /// Formatted display string for the current hotkey (e.g. "⌘⇧R").

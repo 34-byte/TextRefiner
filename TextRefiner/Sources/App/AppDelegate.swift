@@ -4,7 +4,7 @@ import Sparkle
 /// The central hub that wires all components together.
 /// Manages the menu bar icon, spinner states, and coordinates between
 /// onboarding, hotkey detection, and the refinement flow.
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Components
 
@@ -18,15 +18,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var historyController: HistoryWindowController?
     private var settingsController: SettingsWindowController?
     private let updateManager = UpdateManager()
+    private let typingMonitor = TypingMonitor()
+    private let readyIndicator = ReadyIndicatorController()
 
     /// Timer that polls for Accessibility permission after an update resets TCC.
     private var accessibilityPollTimer: Timer?
-
-    /// Kept as a reference so we can update model checkmarks and download status dynamically.
-    private var modelSubmenu: NSMenu?
-
-    /// Cached set of downloaded model IDs — updated each time the Model submenu opens.
-    private var downloadedModels: Set<String> = []
 
     // MARK: - Lifecycle
 
@@ -37,30 +33,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Request notification permission early
         NotificationManager.requestPermission()
 
-        // Show onboarding only when needed:
-        // - First ever launch (flag not yet set), OR
-        // - Accessibility permission was revoked since last launch
-        let hasCompletedOnboarding = UserDefaults.standard.bool(forKey: "com.textrefiner.onboardingCompleted")
-        let accessibilityGranted = AccessibilityService.isTrusted()
+        // Pre-load model in background so first refinement is fast.
+        // This runs independently of quarantine/permission state.
+        Task.detached { try? await self.coordinator.inferenceService.loadModel() }
 
-        if !hasCompletedOnboarding {
-            // First launch — full onboarding
-            showOnboarding()
-        } else if !accessibilityGranted {
-            // Completed onboarding before but permission lost (likely after an update)
-            showAccessibilityRegrantPrompt()
-        } else {
-            startListening()
+        // Strip quarantine asynchronously — Sparkle updates and browser downloads
+        // tag the binary with com.apple.quarantine, which blocks CGEvent tap creation
+        // even when Accessibility is granted. Running this async prevents the main
+        // thread from freezing at launch on slower machines or network volumes.
+        // All permission-dependent setup happens in the completion handler, guaranteeing
+        // quarantine is cleared before any CGEvent tap is attempted.
+        Self.removeQuarantineFlag {
+            self.completeLaunchSetup()
         }
+    }
 
-        // Pre-warm Ollama connection in background
-        Task { await coordinator.ollamaService.prewarm() }
+    /// Runs after quarantine removal completes. Contains all permission-dependent
+    /// launch logic so nothing attempts a CGEvent tap before the flag is cleared.
+    private func completeLaunchSetup() {
+        let hasCompletedOnboarding = UserDefaults.standard.bool(forKey: "com.textrefiner.onboardingCompleted")
+
+        // Use a UUID fallback if CFBundleVersion is unreadable (packaging error,
+        // stripped binary, etc.). "0" as a fallback was dangerous — if the previous
+        // launch also returned nil and stored "0", the strings would match and the
+        // post-update TCC reset would be silently skipped, leaving every user on
+        // that build with a stale CDHash and a broken hotkey (stress test S-08).
+        let currentBuild = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+            ?? "missing-\(UUID().uuidString)"
+        let lastOnboardedBuild = UserDefaults.standard.string(forKey: "com.textrefiner.lastOnboardedBuild")
+        let needsReOnboarding = hasCompletedOnboarding && lastOnboardedBuild != currentBuild
+
+        if !hasCompletedOnboarding || needsReOnboarding {
+            // First launch or app was updated — binary hash changed, so the old
+            // TCC entry is stale (points to a different CDHash). Clear it so
+            // "Grant Access" triggers a fresh system prompt for the current binary.
+            if needsReOnboarding {
+                Self.resetAccessibilityPermission()
+            }
+            // Proactively register the app in the Accessibility list by calling
+            // AXIsProcessTrustedWithOptions with kAXTrustedCheckOptionPrompt: true.
+            // On macOS 14+, CGEvent.tapCreate() alone may not add the app to System
+            // Settings > Accessibility. Without this call, the app can be completely
+            // invisible in the Accessibility list — the user has no toggle to flip.
+            // This must happen before showOnboarding() so the toggle exists by the
+            // time the user navigates to System Settings.
+            AccessibilityService.requestPermission()
+            showOnboarding()
+        } else {
+            // Permission check first: if accessibility was lost since last onboarding
+            // (user manually revoked it, or dev build reset TCC), we MUST show onboarding
+            // again. Without it, nothing ever calls requestPermission() — which is the
+            // only way to trigger the system prompt that adds the app to the Accessibility
+            // list. Silent polling alone would loop forever because the app is invisible
+            // in System Settings (stress test S-22).
+            if !AccessibilityService.isTrusted() {
+                // Proactively register the app in the Accessibility list before
+                // showing onboarding — same reasoning as the first-launch path above.
+                AccessibilityService.requestPermission()
+                showOnboarding()
+            } else if !startListening() {
+                // Trusted but tap failed for a transient reason — poll to recover.
+                startAccessibilityPolling()
+            }
+        }
     }
 
     // MARK: - Menu Bar Setup
 
     /// Creates the menu bar icon (sparkle + A as template image) and dropdown menu.
-    /// Menu structure: Model > [submenu], Prompt Settings..., separator, About, Quit.
     private func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
@@ -71,14 +111,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let menu = NSMenu()
 
-        // Model submenu
-        let modelItem = NSMenuItem(title: "Model", action: nil, keyEquivalent: "")
-        let submenu = NSMenu()
-        submenu.delegate = self  // We implement menuWillOpen to refresh download status
-        modelItem.submenu = submenu
-        self.modelSubmenu = submenu
-        menu.addItem(modelItem)
-
         // Prompt Settings
         menu.addItem(NSMenuItem(title: "Prompt Settings...", action: #selector(showPromptSettings), keyEquivalent: ""))
 
@@ -87,6 +119,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Settings (hotkey configuration, etc.)
         menu.addItem(NSMenuItem(title: "Settings...", action: #selector(showSettings), keyEquivalent: ","))
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Delete AI Model
+        menu.addItem(NSMenuItem(title: "Delete AI Model...", action: #selector(deleteLocalModel), keyEquivalent: ""))
 
         menu.addItem(NSMenuItem.separator())
 
@@ -126,195 +163,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return image
     }
 
-    // MARK: - NSMenuDelegate (Model Submenu)
+    // MARK: - Model Management
 
-    /// Called just before the model submenu opens — refreshes download status.
-    func menuWillOpen(_ menu: NSMenu) {
-        guard menu == modelSubmenu else { return }
-        rebuildModelSubmenu(with: downloadedModels)
-
-        // Async-refresh downloaded models (fast localhost call).
-        // Updates the menu in-place if the result differs from cached state.
-        Task {
-            let freshDownloaded = await ModelManager.shared.fetchDownloadedModels()
-            if freshDownloaded != self.downloadedModels {
-                self.downloadedModels = freshDownloaded
-                await MainActor.run {
-                    self.rebuildModelSubmenu(with: freshDownloaded)
-                }
-            }
-        }
-    }
-
-    /// Rebuilds the Model submenu items based on current download/selection state.
-    private func rebuildModelSubmenu(with downloaded: Set<String>) {
-        guard let submenu = modelSubmenu else { return }
-        submenu.removeAllItems()
-
-        let selectedID = ModelManager.shared.selectedModelID
-
-        // Add a model item for each recommended model
-        for model in ModelManager.recommendedModels {
-            let isDownloaded = downloaded.contains(model.id)
-            let isSelected = model.id == selectedID
-
-            // Build title: "Llama 3.2 (3B) — ~2.0 GB" + optional tags
-            var title = "\(model.displayName) — \(model.size)"
-            if model.isDefault {
-                title += "  ★ Recommended"
-            }
-            if !isDownloaded {
-                title += "  (Not Downloaded)"
-            }
-
-            let item = NSMenuItem(title: title, action: #selector(selectModel(_:)), keyEquivalent: "")
-            item.representedObject = model.id
-            item.target = self
-            item.state = isSelected ? .on : .off
-
-            // Grey out undownloaded models (still clickable — triggers download prompt)
-            if !isDownloaded {
-                item.attributedTitle = NSAttributedString(
-                    string: title,
-                    attributes: [.foregroundColor: NSColor.secondaryLabelColor]
-                )
-            }
-
-            submenu.addItem(item)
-        }
-
-        // Separator + Manage Models section (only if there are downloaded models to manage)
-        let deletableModels = downloaded.filter { $0 != selectedID }
-        if !deletableModels.isEmpty {
-            submenu.addItem(NSMenuItem.separator())
-
-            let headerItem = NSMenuItem(title: "Manage Downloaded Models", action: nil, keyEquivalent: "")
-            headerItem.isEnabled = false
-            submenu.addItem(headerItem)
-
-            for modelID in deletableModels.sorted() {
-                let model = ModelManager.recommendedModels.first { $0.id == modelID }
-                let displayName = model?.displayName ?? modelID
-                let size = model?.size ?? ""
-                let deleteItem = NSMenuItem(
-                    title: "Remove \(displayName) (\(size))",
-                    action: #selector(deleteModel(_:)),
-                    keyEquivalent: ""
-                )
-                deleteItem.representedObject = modelID
-                deleteItem.target = self
-                submenu.addItem(deleteItem)
-            }
-        }
-    }
-
-    // MARK: - Model Actions
-
-    @objc private func selectModel(_ sender: NSMenuItem) {
-        guard let modelID = sender.representedObject as? String else { return }
-
-        // If already selected, do nothing
-        if modelID == ModelManager.shared.selectedModelID { return }
-
-        // Check if the model is downloaded
-        if downloadedModels.contains(modelID) {
-            // Downloaded — select it immediately
-            ModelManager.shared.selectedModelID = modelID
-        } else {
-            // Not downloaded — ask user to confirm download
-            let model = ModelManager.recommendedModels.first { $0.id == modelID }
-            let displayName = model?.displayName ?? modelID
-            let size = model?.size ?? "unknown size"
-
-            let alert = NSAlert()
-            alert.messageText = "Download \(displayName)?"
-            alert.informativeText = "This model is not downloaded yet. It will download \(size) to your Mac. Are you sure you want to proceed?"
-            alert.alertStyle = .informational
-            alert.addButton(withTitle: "Download")
-            alert.addButton(withTitle: "Cancel")
-            NSApp.activate(ignoringOtherApps: true)
-
-            let response = alert.runModal()
-            if response == .alertFirstButtonReturn {
-                downloadAndSelectModel(modelID: modelID)
-            }
-        }
-    }
-
-    /// Downloads a model in the background, then selects it.
-    private func downloadAndSelectModel(modelID: String) {
-        let model = ModelManager.recommendedModels.first { $0.id == modelID }
-        let displayName = model?.displayName ?? modelID
-
-        Task {
-            do {
-                try await coordinator.ollamaService.pullModel(name: modelID) { status in
-                    print("[TextRefiner] Pull progress for \(displayName): \(status)")
-                }
-
-                // Download complete — select the model
-                ModelManager.shared.selectedModelID = modelID
-                downloadedModels.insert(modelID)
-
-                await MainActor.run {
-                    let doneAlert = NSAlert()
-                    doneAlert.messageText = "\(displayName) Ready"
-                    doneAlert.informativeText = "\(displayName) has been downloaded and is now your active model."
-                    doneAlert.alertStyle = .informational
-                    doneAlert.addButton(withTitle: "OK")
-                    NSApp.activate(ignoringOtherApps: true)
-                    doneAlert.runModal()
-                }
-            } catch {
-                await MainActor.run {
-                    let errorAlert = NSAlert()
-                    errorAlert.messageText = "Download Failed"
-                    errorAlert.informativeText = "Could not download \(displayName): \(error.localizedDescription)"
-                    errorAlert.alertStyle = .warning
-                    errorAlert.addButton(withTitle: "OK")
-                    NSApp.activate(ignoringOtherApps: true)
-                    errorAlert.runModal()
-                }
-            }
-        }
-    }
-
-    @objc private func deleteModel(_ sender: NSMenuItem) {
-        guard let modelID = sender.representedObject as? String else { return }
-
-        // Safety: never delete the currently selected model
-        guard modelID != ModelManager.shared.selectedModelID else { return }
-
-        let model = ModelManager.recommendedModels.first { $0.id == modelID }
-        let displayName = model?.displayName ?? modelID
-        let size = model?.size ?? ""
-
+    @objc private func deleteLocalModel() {
         let alert = NSAlert()
-        alert.messageText = "Remove \(displayName)?"
-        alert.informativeText = "This will delete the model from your Mac and free \(size) of storage. You can re-download it later."
+        alert.messageText = "Delete AI Model?"
+        alert.informativeText = "This will remove the \(ModelManager.displayName) model (\(ModelManager.modelSize)) from your Mac. You'll need to re-download it before TextRefiner can refine text again."
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Delete")
         alert.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)
 
         let response = alert.runModal()
         if response == .alertFirstButtonReturn {
-            Task {
-                do {
-                    try await coordinator.ollamaService.deleteModel(name: modelID)
-                    downloadedModels.remove(modelID)
-                    print("[TextRefiner] Deleted model: \(modelID)")
-                } catch {
-                    await MainActor.run {
-                        let errorAlert = NSAlert()
-                        errorAlert.messageText = "Delete Failed"
-                        errorAlert.informativeText = "Could not remove \(displayName): \(error.localizedDescription)"
-                        errorAlert.alertStyle = .warning
-                        errorAlert.addButton(withTitle: "OK")
-                        NSApp.activate(ignoringOtherApps: true)
-                        errorAlert.runModal()
-                    }
-                }
+            do {
+                try coordinator.inferenceService.deleteModel()
+                let doneAlert = NSAlert()
+                doneAlert.messageText = "Model Deleted"
+                doneAlert.informativeText = "The AI model has been removed. TextRefiner will need to re-download it on next use."
+                doneAlert.alertStyle = .informational
+                doneAlert.addButton(withTitle: "OK")
+                doneAlert.runModal()
+            } catch {
+                let errorAlert = NSAlert()
+                errorAlert.messageText = "Delete Failed"
+                errorAlert.informativeText = "Could not remove the model: \(error.localizedDescription)"
+                errorAlert.alertStyle = .warning
+                errorAlert.addButton(withTitle: "OK")
+                errorAlert.runModal()
             }
         }
     }
@@ -343,11 +219,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if settingsController == nil {
             let controller = SettingsWindowController()
             controller.onHotkeyChanged = { [weak self] in
-                // Re-register the CGEvent tap with the new hotkey — no restart required
-                self?.hotkeyManager.stop()
-                self?.hotkeyManager.start()
+                guard let self else { return }
+                // Re-register the CGEvent tap with the new hotkey — no restart required.
+                // The return value MUST be checked: silently discarding it was stress test
+                // bug S-01. If permission lapsed while the app was running and the tap
+                // fails here, the user must be notified — not left with a broken hotkey
+                // and a UI that shows the new shortcut as if everything worked.
+                hotkeyManager.stop()
+                if !hotkeyManager.start() {
+                    showHotkeyPermissionAlert()
+                }
+                // Update the pill label to show the new hotkey
+                readyIndicator.updateHotkey()
                 let display = HotkeyConfiguration.shared.displayString
                 print("[TextRefiner] Hotkey changed to \(display)")
+            }
+            controller.onTypingIndicatorToggled = { [weak self] isEnabled in
+                guard let self else { return }
+                if isEnabled {
+                    self.wireTypingMonitor()
+                    self.typingMonitor.start()
+                } else {
+                    self.typingMonitor.stop()
+                    self.readyIndicator.hide()
+                }
+            }
+            controller.onReplayTutorial = { [weak self] in
+                self?.showOnboarding()
             }
             settingsController = controller
         }
@@ -396,15 +294,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.showPermissionAlert()
         }
 
-        // Hotkey fired, processing begins — show spinner in menu bar + floating panel
+        // Hotkey fired, processing begins — hide ready indicator, show spinner + floating panel
         coordinator.onProcessingStarted = { [weak self] in
+            self?.typingMonitor.forceHide()
+            self?.readyIndicator.hide()
             self?.showSpinner()
             let panel = StreamingPanelController()
             panel.show()
             self?.streamingPanel = panel
         }
 
-        // Ollama done, text ready to paste — swap spinner for green checkmark
+        // Model done, text ready to paste — swap spinner for green checkmark
         coordinator.onRefinementComplete = { [weak self] in
             self?.streamingPanel?.showCheckmark()
         }
@@ -416,7 +316,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.hideSpinner()
         }
 
-        // Error (Ollama down, no text selected, etc.) — show alert, always clean up
+        // Error (model not loaded, no text selected, etc.) — show alert, always clean up
         coordinator.onError = { [weak self] error in
             self?.streamingPanel?.dismiss()
             self?.streamingPanel = nil
@@ -427,32 +327,155 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Hotkey + Onboarding
 
-    /// Starts listening for the configured hotkey globally.
-    private func startListening() {
+    /// Starts listening for the configured hotkey globally and activates the typing monitor.
+    /// Returns true if the CGEvent tap was successfully created.
+    ///
+    /// **This method has no UI side effects on failure.** It returns false and the caller
+    /// decides the appropriate response — silent polling, an inline error, or an alert.
+    /// This is intentional: when the tap attempt triggers macOS's own system Accessibility
+    /// prompt, showing our alert on top of it creates a confusing double-dialog
+    /// (stress test S-21). Callers that want to show an alert do so explicitly.
+    @discardableResult
+    private func startListening() -> Bool {
+        // Kill any existing poll timer first. If startListening() succeeds, the timer's
+        // job is done. If it fails, the caller will restart polling if needed. Either way
+        // the old timer must not keep firing in the background
+        // (stress test S-02: poll timer racing with onReadyForTrial).
+        accessibilityPollTimer?.invalidate()
+        accessibilityPollTimer = nil
+
         hotkeyManager.onHotkeyPressed = { [weak self] in
+            // Hide the ready indicator the moment the hotkey fires
+            self?.typingMonitor.forceHide()
+            self?.readyIndicator.hide()
             self?.coordinator.startRefinement()
         }
-        hotkeyManager.start()
-        print("[TextRefiner] Listening for \(HotkeyConfiguration.shared.displayString)...")
+
+        let tapCreated = hotkeyManager.start()
+        print("[TextRefiner] Hotkey tap created: \(tapCreated) — listening for \(HotkeyConfiguration.shared.displayString)")
+
+        if tapCreated {
+            // Start the typing monitor only if the feature is enabled
+            let isEnabled = UserDefaults.standard.object(forKey: TypingMonitor.enabledKey) == nil
+                || UserDefaults.standard.bool(forKey: TypingMonitor.enabledKey)
+            if isEnabled {
+                wireTypingMonitor()
+                typingMonitor.start()
+            }
+        }
+
+        return tapCreated
+    }
+
+    private func wireTypingMonitor() {
+        typingMonitor.onShouldShow = { [weak self] fieldFrame in
+            self?.readyIndicator.show(near: fieldFrame)
+        }
+        typingMonitor.onShouldHide = { [weak self] in
+            self?.readyIndicator.hide()
+        }
     }
 
     /// Shows the onboarding window, then starts listening when complete.
     private func showOnboarding() {
-        let controller = OnboardingWindowController()
-        controller.onComplete = { [weak self] in
-            // Mark onboarding as completed so we don't show it again on next launch
-            UserDefaults.standard.set(true, forKey: "com.textrefiner.onboardingCompleted")
+        // Guard against opening a second onboarding window while one is already showing.
+        // Multiple code paths can trigger showOnboarding() — first launch, version change,
+        // permission failure mid-session, and "Replay Tutorial" from Settings. Without
+        // this guard, two windows could open simultaneously, both trying to register the
+        // hotkey at the same time (stress test S-07).
+        if let existing = onboardingController {
+            existing.bringToFront()
+            return
+        }
 
-            // Start listening immediately — no dependency on controller cleanup order
-            self?.startListening()
-            // Defer the controller nil-out by one runloop tick so any pending
-            // SwiftUI/AppKit layout work finishes before the hosting controller deallocates
+        let controller = OnboardingWindowController()
+
+        // onReadyForTrial is called when the user clicks "Next" on setup page 1.
+        // It tries to register the actual CGEvent tap and returns success/failure so
+        // the onboarding can gate the page transition on whether the hotkey ACTUALLY works.
+        // This is the critical guardrail: the user cannot reach the tutorial page unless
+        // the real tap was created successfully.
+        controller.onReadyForTrial = { [weak self] in
+            return self?.startListening() ?? false
+        }
+
+        controller.onComplete = { [weak self] in
+            // Mark onboarding as completed and record this build number.
+            // Use a UUID fallback — consistent with completeLaunchSetup() — so that
+            // an unreadable version number always triggers re-onboarding next launch
+            // rather than silently pinning to a "0" that never changes (stress test S-08).
+            UserDefaults.standard.set(true, forKey: "com.textrefiner.onboardingCompleted")
+            let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+                ?? "missing-\(UUID().uuidString)"
+            UserDefaults.standard.set(build, forKey: "com.textrefiner.lastOnboardedBuild")
+
+            // Hotkey listener was already started when the tutorial page appeared
+            // (via onReadyForTrial). Just clean up the onboarding controller.
             DispatchQueue.main.async {
                 self?.onboardingController = nil
             }
         }
+
+        // onDismissedEarly fires when the user closes the setup window via the red-X
+        // button before completing setup (stress test S-06). The hotkey was never
+        // registered. Start background polling so the app can self-heal if they later
+        // grant Accessibility permission through System Settings.
+        controller.onDismissedEarly = { [weak self] in
+            DispatchQueue.main.async {
+                self?.onboardingController = nil
+            }
+            self?.startAccessibilityPolling()
+        }
+
         controller.show()
         self.onboardingController = controller
+    }
+
+    /// Shown when the hotkey tap cannot be created — Accessibility permission is missing
+    /// or stale (common after ad-hoc binary updates). Gives clear, specific instructions.
+    private func showHotkeyPermissionAlert() {
+        let alert = NSAlert()
+        alert.messageText = "Hotkey Not Working — Permission Needed"
+        alert.informativeText = """
+            TextRefiner couldn't register the \(HotkeyConfiguration.shared.displayString) hotkey. \
+            This happens after updates because macOS ties Accessibility permission to the specific \
+            binary — the old permission no longer applies.
+
+            Fix: Open System Settings → Privacy & Security → Accessibility, find TextRefiner, \
+            toggle it OFF then back ON. Then click Retry.
+            """
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Open System Settings")
+        alert.addButton(withTitle: "Retry")
+        alert.addButton(withTitle: "Later")
+
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+
+        switch response {
+        case .alertFirstButtonReturn: // Open System Settings
+            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                NSWorkspace.shared.open(url)
+            }
+            // Start polling — when the user re-grants, startListening() fires automatically
+            startAccessibilityPolling()
+
+        case .alertSecondButtonReturn: // Retry
+            // If retry still fails, fall through to silent background polling instead of
+            // re-showing this alert. Re-alerting on failure creates an infinite modal stack
+            // (each "Retry" that fails opens another copy of this dialog on top of the
+            // previous one — stress test S-05).
+            if !startListening() {
+                startAccessibilityPolling()
+            }
+
+        default: // Later
+            // The user said "later" but they expect the app to keep trying in the background.
+            // Without polling, the hotkey stays broken for the entire session unless they
+            // restart the app. Silent polling self-heals if they grant permission later
+            // through System Settings (stress test S-04).
+            startAccessibilityPolling()
+        }
     }
 
     // MARK: - Alerts
@@ -472,13 +495,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let response = alert.runModal()
 
         if response == .alertFirstButtonReturn {
+            // Stop any running poll timer before entering onboarding — the timer calling
+            // startListening() concurrently with onboarding's onReadyForTrial creates a
+            // race where both try to register the tap at the same time (stress test S-10).
+            accessibilityPollTimer?.invalidate()
+            accessibilityPollTimer = nil
             // Stop the existing (now-broken) event tap before re-onboarding
             hotkeyManager.stop()
             showOnboarding()
         }
     }
 
-    /// Shown when refinement fails (Ollama down, empty response, etc.)
+    /// Shown when refinement fails (model error, empty response, etc.)
     private func showErrorAlert(_ error: Error) {
         let alert = NSAlert()
         alert.messageText = "TextRefiner"
@@ -495,42 +523,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateManager.checkForUpdates()
     }
 
-    // MARK: - Post-Update Accessibility Re-grant
-
-    /// After an update, the binary hash changes (ad-hoc signing) and TCC invalidates
-    /// the Accessibility grant. This shows a friendly prompt and polls until re-granted.
-    private func showAccessibilityRegrantPrompt() {
-        let alert = NSAlert()
-        alert.messageText = "Accessibility Permission Required"
-        alert.informativeText = """
-        TextRefiner was just updated. macOS requires you to re-enable \
-        Accessibility permission after an update.
-
-        In System Settings → Privacy & Security → Accessibility:
-        • If TextRefiner is listed, toggle it OFF then ON
-        • If not listed, click + and add TextRefiner
-
-        This window will close automatically once permission is granted.
-        """
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Open System Settings")
-        alert.addButton(withTitle: "Later")
-
-        NSApp.activate(ignoringOtherApps: true)
-        let response = alert.runModal()
-
-        if response == .alertFirstButtonReturn {
-            // Open Accessibility settings directly
-            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-                NSWorkspace.shared.open(url)
-            }
-        }
-
-        // Start polling for permission regardless of button choice
-        startAccessibilityPolling()
-    }
-
-    /// Polls for Accessibility permission every 1.5s. When granted, starts the hotkey listener.
+    /// Polls for Accessibility permission every 1.5s. When granted, re-registers the hotkey listener.
     private func startAccessibilityPolling() {
         accessibilityPollTimer?.invalidate()
         accessibilityPollTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] timer in
@@ -543,15 +536,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // MARK: - Permission Management
+
+    /// Resets the Accessibility TCC entry for this app's bundle ID.
+    /// With ad-hoc signing, every binary change produces a new CDHash. The old
+    /// TCC entry becomes stale — the toggle appears ON in System Settings but
+    /// doesn't match the current binary. Resetting forces a clean re-grant.
+    private static func resetAccessibilityPermission() {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        process.arguments = ["reset", "Accessibility", bundleID]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+        process.waitUntilExit()
+        print("[TextRefiner] Reset Accessibility TCC for \(bundleID)")
+    }
+
+    // MARK: - Quarantine Removal
+
+    /// Removes the com.apple.quarantine extended attribute from the app bundle,
+    /// then calls the completion handler on the main thread.
+    ///
+    /// This is critical for ad-hoc signed apps distributed outside the App Store:
+    /// macOS blocks CGEvent tap creation for quarantined binaries, even when
+    /// Accessibility permission is granted. Sparkle updates and browser downloads
+    /// both set this flag. Must complete before any Accessibility / CGEvent checks.
+    ///
+    /// Runs on a background thread to avoid blocking the main thread at launch —
+    /// on slow machines, network volumes, or large bundles, xattr -dr can take
+    /// multiple seconds synchronously (stress test S-12).
+    private static func removeQuarantineFlag(completion: @escaping () -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let bundlePath = Bundle.main.bundlePath
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
+            process.arguments = ["-dr", "com.apple.quarantine", bundlePath]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try? process.run()
+            process.waitUntilExit()
+            DispatchQueue.main.async { completion() }
+        }
+    }
+
     // MARK: - About
 
     @objc private func showAbout() {
-        let modelName = ModelManager.shared.selectedModel?.displayName ?? ModelManager.shared.selectedModelID
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
         let alert = NSAlert()
         alert.messageText = "TextRefiner"
         let hotkey = HotkeyConfiguration.shared.displayString
-        alert.informativeText = "Highlight text, press \(hotkey), get better writing.\nPowered by Ollama (local AI).\nActive model: \(modelName)\n\nVersion \(version)"
+        alert.informativeText = "Highlight text, press \(hotkey), get better writing.\nPowered by local AI.\nModel: \(ModelManager.displayName)\n\nVersion \(version)"
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
         alert.runModal()

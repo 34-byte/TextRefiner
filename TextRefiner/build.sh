@@ -55,8 +55,9 @@ rm -rf "$APP_BUNDLE"
 mkdir -p "$MACOS_DIR"
 mkdir -p "$RESOURCES_DIR"
 
-# Copy binary
+# Copy binary and fix rpath so it finds frameworks in Contents/Frameworks/
 cp "$BINARY" "$MACOS_DIR/$APP_NAME"
+install_name_tool -add_rpath @executable_path/../Frameworks "$MACOS_DIR/$APP_NAME" 2>/dev/null || true
 
 # Copy the appropriate Info.plist based on build mode
 if [ "$MODE" = "release" ]; then
@@ -104,6 +105,72 @@ if [ -f "$SOURCE_ICON" ]; then
     echo "    icon_ok"
 else
     echo "    (skipped — Resources/AppIcon.png not found)"
+fi
+
+# --- Compile MLX Metal shaders into default.metallib ---
+# SPM cannot compile .metal files — we must do it manually.
+# MLX looks for mlx.metallib colocated with the binary at runtime.
+METAL_SRC_DIR="$BUILD_DIR/checkouts/mlx-swift/Source/Cmlx/mlx-generated/metal"
+AIR_DIR="$BUILD_DIR/mlx_air"
+METALLIB_OUT="$MACOS_DIR/mlx.metallib"
+
+if [ -d "$METAL_SRC_DIR" ]; then
+    echo "==> Compiling MLX Metal shaders..."
+    rm -rf "$AIR_DIR"
+    mkdir -p "$AIR_DIR"
+
+    find "$METAL_SRC_DIR" -name "*.metal" -print0 | while IFS= read -r -d '' METAL_FILE; do
+        BASENAME=$(basename "$METAL_FILE" .metal)
+        xcrun -sdk macosx metal -c "$METAL_FILE" \
+            -I "$METAL_SRC_DIR" \
+            -I "$METAL_SRC_DIR/steel" \
+            -I "$METAL_SRC_DIR/steel/gemm" \
+            -I "$METAL_SRC_DIR/steel/attn" \
+            -I "$METAL_SRC_DIR/steel/attn/kernels" \
+            -I "$METAL_SRC_DIR/steel/conv" \
+            -I "$METAL_SRC_DIR/steel/utils" \
+            -I "$METAL_SRC_DIR/fft" \
+            -std=metal3.1 \
+            -mmacosx-version-min=14.0 \
+            -o "$AIR_DIR/$BASENAME.air" 2>/dev/null
+    done
+
+    xcrun -sdk macosx metallib "$AIR_DIR"/*.air -o "$METALLIB_OUT" 2>/dev/null
+    rm -rf "$AIR_DIR"
+    # Sign the metallib so it passes app bundle code signing
+    codesign --force --sign - "$METALLIB_OUT"
+    echo "    metallib_ok ($(du -h "$METALLIB_OUT" | cut -f1 | xargs))"
+else
+    echo "WARNING: MLX Metal sources not found — model inference will fail at runtime"
+fi
+
+# --- Copy SPM resource bundles (tokenizer configs, etc.) ---
+echo "==> Copying resource bundles..."
+for BUNDLE_PATH in "$BUILD_DIR/arm64-apple-macosx/release/"*.bundle; do
+    if [ -d "$BUNDLE_PATH" ]; then
+        BUNDLE_NAME=$(basename "$BUNDLE_PATH")
+        cp -a "$BUNDLE_PATH" "$RESOURCES_DIR/$BUNDLE_NAME"
+        echo "    $BUNDLE_NAME"
+    fi
+done
+
+# --- Embed Sparkle.framework ---
+FRAMEWORKS_DIR="$CONTENTS/Frameworks"
+SPARKLE_SOURCE="$BUILD_DIR/arm64-apple-macosx/release/Sparkle.framework"
+if [ ! -d "$SPARKLE_SOURCE" ]; then
+    # Fallback to xcframework artifact
+    SPARKLE_SOURCE="$BUILD_DIR/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
+fi
+
+if [ -d "$SPARKLE_SOURCE" ]; then
+    echo "==> Embedding Sparkle.framework..."
+    mkdir -p "$FRAMEWORKS_DIR"
+    cp -a "$SPARKLE_SOURCE" "$FRAMEWORKS_DIR/"
+    # Sign the embedded framework before signing the app
+    codesign --force --sign - "$FRAMEWORKS_DIR/Sparkle.framework"
+    echo "    sparkle_ok"
+else
+    echo "WARNING: Sparkle.framework not found — app will crash on launch if it links Sparkle"
 fi
 
 echo "==> Signing with ad-hoc signature..."

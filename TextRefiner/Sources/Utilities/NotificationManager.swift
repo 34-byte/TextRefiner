@@ -25,13 +25,13 @@ enum NotificationManager {
         UNUserNotificationCenter.current().add(request)
     }
 
-    /// Shows an error notification. Uses the Ollama-specific message for connection failures.
+    /// Shows an error notification.
     static func postFailure(error: Error) {
         let content = UNMutableNotificationContent()
         content.title = "TextRefiner"
 
-        if error is OllamaError || error is URLError {
-            content.body = "Could not connect to Ollama. Is it running?"
+        if error is InferenceError {
+            content.body = "Model inference failed. Please restart TextRefiner."
         } else {
             content.body = error.localizedDescription
         }

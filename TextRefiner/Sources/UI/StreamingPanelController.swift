@@ -4,7 +4,7 @@ import Cocoa
 /// but smaller and more subtle.
 ///
 /// States:
-///   1. Spinner  — while Ollama is processing
+///   1. Spinner  — while model is processing
 ///   2. Checkmark — green ✓ after text is pasted (confirmation, 1s)
 ///   3. Dismissed — auto-cleans up
 ///

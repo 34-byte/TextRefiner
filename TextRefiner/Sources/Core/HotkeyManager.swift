@@ -10,10 +10,24 @@ final class HotkeyManager {
     /// Called on the main thread when ⌘⇧R is pressed.
     var onHotkeyPressed: (() -> Void)?
 
+    /// True if the event tap is currently installed AND enabled by macOS.
+    /// Checks the real enabled state — not just whether the tap object exists.
+    /// A tap can exist (non-nil) but be temporarily disabled by macOS under load;
+    /// reenableTap() handles that case. This property reflects live capability.
+    var isRunning: Bool {
+        guard let tap = eventTap else { return false }
+        return CGEvent.tapIsEnabled(tap: tap)
+    }
+
     /// Installs the global event tap. Must be called after Accessibility permission is granted.
+    /// Calls stop() first so it is safe to call multiple times without leaking taps.
     /// Returns true if the tap was successfully created.
     @discardableResult
     func start() -> Bool {
+        stop() // Always clean up any previous tap — prevents double-tap leaks when
+               // startListening() is called more than once (e.g. from the accessibility
+               // poll timer firing after onReadyForTrial already registered a tap).
+
         let eventMask = (1 << CGEventType.keyDown.rawValue)
 
         guard let tap = CGEvent.tapCreate(
@@ -30,7 +44,10 @@ final class HotkeyManager {
 
         self.eventTap = tap
         self.runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
+        // Use CFRunLoopGetMain() — not CFRunLoopGetCurrent(). These happen to be the
+        // same thread today, but CFRunLoopGetCurrent() is contextual and would silently
+        // register into a background thread's loop if ever called from a Task.detached.
+        CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
         return true
     }
@@ -39,9 +56,14 @@ final class HotkeyManager {
     func stop() {
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
+            // Fully invalidate the Mach port — disable alone doesn't close the channel.
+            // A keypress already in-flight when stop() is called could otherwise still
+            // arrive at the callback after eventTap is set to nil.
+            CFMachPortInvalidate(tap)
         }
         if let source = runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
+            // Match the run loop used in start() — must be the main run loop.
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
         }
         eventTap = nil
         runLoopSource = nil
@@ -67,9 +89,12 @@ private func hotkeyCallback(
 
     let manager = Unmanaged<HotkeyManager>.fromOpaque(userInfo).takeUnretainedValue()
 
-    // macOS can disable the tap under load — re-enable it
+    // macOS can disable the tap under load — re-enable it.
+    // Dispatch to main: reenableTap() reads/writes eventTap, which is also
+    // written by stop()/start() on the main thread. Dispatching eliminates the
+    // data race between this Mach port callback thread and the main thread.
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-        manager.reenableTap()
+        DispatchQueue.main.async { manager.reenableTap() }
         return Unmanaged.passRetained(event)
     }
 
