@@ -20,6 +20,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let updateManager = UpdateManager()
     private let typingMonitor = TypingMonitor()
     private let readyIndicator = ReadyIndicatorController()
+    /// Retains the active NSSound instance for its full playback duration.
+    private var currentSound: NSSound?
 
     /// Timer that polls for Accessibility permission after an update resets TCC.
     private var accessibilityPollTimer: Timer?
@@ -32,10 +34,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Request notification permission early
         NotificationManager.requestPermission()
-
-        // Pre-load model in background so first refinement is fast.
-        // This runs independently of quarantine/permission state.
-        Task.detached { try? await self.coordinator.inferenceService.loadModel() }
 
         // Strip quarantine asynchronously — Sparkle updates and browser downloads
         // tag the binary with com.apple.quarantine, which blocks CGEvent tap creation
@@ -294,34 +292,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.showPermissionAlert()
         }
 
-        // Hotkey fired, processing begins — hide ready indicator, show spinner + floating panel
+        // Hotkey fired, processing begins — hide ready indicator, show spinner + floating panel.
+        // Dismiss any existing panel first (e.g. an error HUD still counting down).
+        // Enable Escape key interception so the user can cancel.
         coordinator.onProcessingStarted = { [weak self] in
+            self?.streamingPanel?.dismiss()
+            self?.streamingPanel = nil
             self?.typingMonitor.forceHide()
             self?.readyIndicator.hide()
             self?.showSpinner()
             let panel = StreamingPanelController()
             panel.show()
             self?.streamingPanel = panel
+            self?.hotkeyManager.onEscapePressed = { [weak self] in
+                self?.coordinator.cancelRefinement()
+            }
         }
 
         // Model done, text ready to paste — swap spinner for green checkmark
         coordinator.onRefinementComplete = { [weak self] in
             self?.streamingPanel?.showCheckmark()
+            self?.playSound(resource: "Success_Sound", extension: "mp3")
         }
 
-        // Paste complete — dismiss everything
+        // Paste complete — dismiss everything, stop intercepting Escape
         coordinator.onProcessingFinished = { [weak self] in
+            self?.hotkeyManager.onEscapePressed = nil
             self?.streamingPanel?.dismiss()
             self?.streamingPanel = nil
             self?.hideSpinner()
         }
 
-        // Error (model not loaded, no text selected, etc.) — show alert, always clean up
-        coordinator.onError = { [weak self] error in
+        // User cancelled with Escape — dismiss spinner/panel, no text pasted
+        coordinator.onRefinementCancelled = { [weak self] in
+            self?.hotkeyManager.onEscapePressed = nil
             self?.streamingPanel?.dismiss()
             self?.streamingPanel = nil
             self?.hideSpinner()
-            self?.showErrorAlert(error)
+        }
+
+        // Error — input too long gets the error HUD (auto-dismisses after 5s).
+        // All other errors dismiss the panel immediately and show an NSAlert.
+        coordinator.onError = { [weak self] error in
+            self?.hotkeyManager.onEscapePressed = nil
+            self?.playSound(resource: "Fail_sound", extension: "mp3")
+            if case RefinementError.inputTooLong = error {
+                self?.hideSpinner()
+                self?.streamingPanel?.showInputLimitError {
+                    self?.streamingPanel = nil
+                }
+            } else {
+                self?.streamingPanel?.dismiss()
+                self?.streamingPanel = nil
+                self?.hideSpinner()
+                self?.showErrorAlert(error)
+            }
         }
     }
 
@@ -592,5 +617,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
         alert.runModal()
+    }
+
+    // MARK: - Audio Feedback
+
+    /// Plays a bundled sound file. Retains the instance in `currentSound` so ARC
+    /// doesn't deallocate it before playback finishes. Stops any in-progress sound first.
+    private func playSound(resource: String, extension ext: String) {
+        guard let url = Bundle.main.url(forResource: resource, withExtension: ext),
+              let sound = NSSound(contentsOf: url, byReference: false) else { return }
+        currentSound?.stop()
+        currentSound = sound
+        sound.play()
     }
 }

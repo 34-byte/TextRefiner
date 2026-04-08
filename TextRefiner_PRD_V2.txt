@@ -285,17 +285,26 @@ SUGGESTED V1.1 ADDITIONS
 ─────────────────────────────────────────────────────────────────────
 
   ✓ Settings window (replaces re-onboarding for permission changes)
-  - Refinement Level toggle in menu bar (Level 1 / Level 2 / Level 3)
   ✓ Custom hotkey configuration (see spec below)
   ✓ Launch on login toggle
   ✓ History panel (last 10 refinements)
   ✓ Model selection (beyond llama3.2:1b)
-  - Cloud LLM fallback option (OpenAI, Anthropic)
+  → Refinement Levels — moved to v1.2 (see note below)
+  → Cloud LLM fallback — out of scope until further notice
   - Onboarding revamp — full walkthrough UX (see spec below)
 
 ─────────────────────────────────────────────────────────────────────
-V1.1 SPEC — REFINEMENT LEVELS
+V1.1 SPEC — REFINEMENT LEVELS [MOVED TO V1.2 — SEE BELOW]
 ─────────────────────────────────────────────────────────────────────
+
+  [2026-04-06] DIRECTION CHANGE: The original 3-level approach
+  (grammar fix / restructure / full rewrite) is replaced by a
+  tone-adaptive system prompt strategy. See V1.2 ADDITIONS for
+  the new spec.
+
+  Original spec preserved below for reference only — DO NOT implement.
+
+  ---
 
   Three levels of refinement intensity, selectable from the menu bar.
   Each level uses a different prompt that controls how aggressively
@@ -400,31 +409,134 @@ V1.1 SPEC — ONBOARDING REVAMP
 SUGGESTED V1.2 ADDITIONS
 ─────────────────────────────────────────────────────────────────────
 
-  1. Data for Nerds — Stats & Analytics Dashboard
+  0. Tone-Adaptive Refinement (moved from v1.1 — replaces Refinement Levels)
+
+     [2026-04-06] Instead of 3 manual intensity levels, the system
+     prompt should analyze the user's text and automatically adapt
+     its refinement style to match the detected tone and register.
+
+     Core idea: the user's text IS the context signal. No app
+     detection, no manual mode selection — one hotkey that always
+     does the right thing.
+
+     Behavior:
+       - Casual text (Slack message, quick note) → preserve casual
+         tone, fix grammar/spelling, keep it natural
+       - Formal text (email, LinkedIn post) → elevate to professional
+         register, fix "I think" → stronger phrasing, proper structure
+       - Technical text (code comments, docs) → preserve precision,
+         fix clarity and conciseness
+       - Mixed/ambiguous → default to light-touch grammar fixes,
+         preserve the author's voice
+
+     Implementation approach:
+       - Single system prompt that instructs the model to first
+         analyze the tone/register/formality of the input text,
+         then adapt its refinement strategy accordingly
+       - No UI changes needed — the intelligence is in the prompt
+       - No new settings, no mode selection, no per-app configuration
+       - The prompt must be carefully engineered and validated against
+         diverse text samples (casual, formal, technical, mixed)
+
+     Why this approach (from user testing):
+       - Users don't want to manually pick a refinement level
+       - Users don't want to configure per-app rules
+       - Users want one hotkey that "just works" regardless of context
+       - The text itself contains all the information needed to
+         determine the right refinement style
+
+  1. Polished HUD Animations
+     [2026-04-06] Replace the current static spinner/checkmark with
+     smoother, higher-quality animations:
+       - Loading: refined spinner or pulsing animation (not the
+         default NSProgressIndicator look)
+       - Checkmark: animated stroke draw, not a static image swap
+       - Smooth scale-up on appear, fade on dismiss
+       - Keep it minimal and fast — no confetti, no Easter eggs
+
+  2. Instant Text Deployment — Remove Post-Refinement Delay
+     [2026-04-06] From user testing: the delay between refinement
+     completing and text appearing feels sluggish. The refined text
+     should be pasted immediately when generation finishes — remove
+     the checkmark display delay and any artificial pauses in the
+     paste flow. Speed > ceremony.
+
+  3. Subtle Audio Feedback
+     [2026-04-06] Two very short, calm, unique sounds:
+       - Activation sound: plays when the user triggers refinement
+         (hotkey press). Confirms the app heard them.
+       - Completion sound: plays when refined text is presented.
+         Confirms it's done.
+     Requirements:
+       - Extremely brief (<0.5s each), calm, distinctive
+       - Must not feel like a system alert — should feel branded
+       - Use bundled CAF/WAV files (not system sounds)
+       - Default: ON. Toggle in Settings to disable.
+       - No error sound, no volume slider — keep it simple
+
+  4. Crash Testing & Edge Case Hardening
+     [2026-04-06] Dedicated effort to stress-test and stabilize:
+       - Structured edge-case testing (long text, empty selection,
+         rapid-fire hotkey, mid-refinement cancel, app switching
+         during inference, sleep/wake, low memory)
+       - Crash reporting: investigate lightweight crash logging
+         (local-only, no telemetry) to diagnose issues users report
+       - Performance profiling: identify bottlenecks in the
+         copy → infer → paste pipeline
+       - Document known failure modes and recovery paths
+
+  5. Improved Tutorial / Onboarding
+     [2026-04-06] Current onboarding gets users through setup but
+     doesn't teach them how to get the most out of TextRefiner.
+     Improvements:
+       - Better visual walkthrough of the refinement flow
+       - Show before/after examples of refined text
+       - Explain what kinds of text work best
+       - Make the trial refinement more prominent / guided
+       - Consider a "tips" system for the first few uses
+
+  6. Performance Optimization for Base Hardware
+     [2026-04-06] Investigate ways to reduce time-to-result on the
+     weakest supported hardware: M1 with 8 GB RAM.
+     Areas to explore:
+       - Smaller or more quantized model variants
+       - MLX generation parameters (context window, batch size)
+       - Prompt length optimization (shorter system prompt = faster)
+       - Lazy model loading vs keeping model warm in memory
+       - Measure baseline: how long does a typical refinement take
+         on M1/8GB vs M1 Pro/16GB vs M2/24GB?
+
+  7. Privacy Messaging
+     [2026-04-06] From user testing: many potential users are
+     concerned about where their text goes. TextRefiner runs 100%
+     locally — this is a major selling point that needs to be
+     communicated clearly and repeatedly.
+       - Onboarding: add a dedicated privacy step or prominent
+         callout: "Your text never leaves your Mac. All processing
+         happens on-device."
+       - Menu bar / About: visible "100% Local" badge or label
+       - First-refinement tooltip or notification reinforcing privacy
+       - Consider a "Privacy" section in Settings explaining exactly
+         what is stored and where (prompts.json, history, stats,
+         model weights — all local, never uploaded)
+       - No analytics, no telemetry, no network calls for inference
+     Note: history, stats, and gamification features all store data
+     locally. The privacy message should make this transparent —
+     "all your data stays on your Mac" — rather than removing features.
+
+  8. Data for Nerds — Stats & Analytics Dashboard
      A "Stats" window accessible from the menu bar showing:
        - Total refinements count (all-time)
        - Words changed / removed / added (cumulative + per-refinement)
        - Most frequently changed words (top 10 table)
-       - Average refinement time (Ollama latency)
+       - Average refinement time
        - Streak tracker (consecutive days of use)
        - Character/word count savings over time
      Persisted to ~/Library/Application Support/TextRefiner/stats.json.
      Lightweight diff engine compares original vs refined text to
      extract word-level changes.
 
-  2. Passive Presence Reminder
-     Grammarly-style ambient indicator that reminds users the tool
-     exists without being intrusive. Options to explore:
-       - Floating micro-badge near the cursor when text is selected
-         for >2 seconds (subtle, dismisses on its own)
-       - Menu bar icon pulse/glow animation every N minutes of
-         inactivity (configurable, off by default)
-       - Gentle tooltip near the menu bar icon on first text selection
-         after app launch: "Highlight text and press ⌘⇧R to refine"
-     Must NOT steal focus or interfere with typing. Non-activating
-     NSPanel or overlay only.
-
-  3. Gamification — Levels & Milestones
+  9. Gamification — Levels & Milestones
        - XP system: earn points per refinement (bonus for longer text,
          streaks, using different models)
        - Levels: Beginner (0–10), Editor (11–50), Wordsmith (51–200),
@@ -436,46 +548,50 @@ SUGGESTED V1.2 ADDITIONS
        - Weekly summary notification: "This week: 23 refinements,
          142 words improved"
 
-  4. Sound Effects
-       - Subtle audio feedback on key events:
-         • Hotkey press: soft "activation" click/chime
-         • Refinement complete: satisfying success tone
-         • Error: gentle alert sound
-       - Use system sounds (NSSound) or bundled short WAV/CAF files
-       - Volume control in Settings (slider or off/low/medium/high)
-       - "Mute all sounds" toggle in Settings
-       - Default: ON at low volume — sounds should feel native to
-         macOS, not gamey
+  10. Passive Presence Reminder
+     Grammarly-style ambient indicator that reminds users the tool
+     exists without being intrusive. Options to explore:
+       - Floating micro-badge near the cursor when text is selected
+         for >2 seconds (subtle, dismisses on its own)
+       - Menu bar icon pulse/glow animation every N minutes of
+         inactivity (configurable, off by default)
+       - Gentle tooltip near the menu bar icon on first text selection
+         after app launch: "Highlight text and press ⌘⇧R to refine"
+     Must NOT steal focus or interfere with typing. Non-activating
+     NSPanel or overlay only.
 
-  5. Delight Feedback — Micro-interactions
-       - HUD enhancements:
-         • Confetti/sparkle particle burst on checkmark (occasional,
-           not every time — e.g., every 10th refinement or on
-           milestones)
-         • Smooth scale-up animation on HUD appear/dismiss
-         • Checkmark draws with an animated stroke, not a static swap
-       - Menu bar icon: brief sparkle animation on successful refine
-       - Haptic feedback via NSHapticFeedbackManager (trackpad tap on
-         success) — subtle, respects system haptic settings
-       - Easter eggs: special animation on round-number refinements
-         (100th, 500th, 1000th)
-
-  6. Design Refresh — Visual Polish
+  11. Design Refresh — Visual Polish
        - Settings window: move from manual frame layout to proper
          Auto Layout or NSStackView for cleaner alignment and
          resize behavior
        - Consistent spacing, padding, and typography across all
-         windows (Settings, History, Prompt Settings, Onboarding)
+         windows (Settings, Prompt Settings, Onboarding)
        - HUD panel: gradient background option, configurable size
          (compact/normal), position preference (center/corner)
-       - History window: richer cards with syntax-highlighted diffs
-         (green for added words, red/strikethrough for removed)
        - Dark/light mode: verify all custom colors adapt correctly
          (currently relies on template images and system colors)
        - Menu bar icon: explore animated Lottie-style icon or
          multi-state SF Symbols for richer status indication
        - About window: proper branded layout with app icon, version,
          links — replace the plain NSAlert
+
+
+  12. User-Configurable Input Character Limit
+
+      [2026-04-07] The maximum input length is currently hard-coded at 10,000 characters.
+      Advanced users (developers, long-form writers) may need a higher limit.
+
+      Behavior:
+        - Settings window: "Max input length" numeric field, default 10,000, range 1,000–50,000.
+        - Typing indicator pill hides when character count exceeds the configured limit.
+        - Error HUD shows "character limit is Xk" reflecting the configured value.
+        - If input exceeds the limit at refinement time, show the error HUD (red ✕ + 5s timer bar).
+
+      Implementation notes:
+        - Store in UserDefaults key `com.textrefiner.maxInputCharacters`.
+        - Both RefinementCoordinator and TypingMonitor read from UserDefaults at call time
+          (same pattern as active prompt and hotkey config — no restart needed).
+        - No model changes required.
 
 
 ─────────────────────────────────────────────────────────────────────

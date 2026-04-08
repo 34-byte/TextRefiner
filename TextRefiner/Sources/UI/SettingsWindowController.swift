@@ -372,11 +372,13 @@ final class SettingsWindowController {
                         let appBundleURL = URL(fileURLWithPath: appDir)
                             .appendingPathComponent("TextRefiner.app")
 
-                        // Use a shell to launch after a short delay so this process can exit
-                        let relaunch = Process()
-                        relaunch.executableURL = URL(fileURLWithPath: "/bin/bash")
-                        relaunch.arguments = ["-c", "sleep 1 && open \"\(appBundleURL.path)\""]
-                        try? relaunch.run()
+                        // Quit first, then launch the new app after a short delay
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                            let relaunch = Process()
+                            relaunch.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+                            relaunch.arguments = [appBundleURL.path]
+                            try? relaunch.run()
+                        }
 
                         // Quit the current app
                         NSApp.terminate(nil)

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Hub
 import MLX
@@ -13,7 +14,15 @@ import MLXRandom // Part of the MLX package
 final class LocalInferenceService: @unchecked Sendable {
 
     /// The single model used by TextRefiner.
-    static let modelConfiguration = LLMRegistry.llama3_2_3B_4bit
+    /// Pinned to a specific commit so the downloaded files are immutable — any substitution
+    /// or tampering is caught by verifyConfigIntegrity() before inference runs.
+    static let modelConfiguration = ModelConfiguration(
+        id: "mlx-community/Llama-3.2-3B-Instruct-4bit",
+        revision: "7f0dc925e0d0afb0322d96f9255cfddf2ba5636e"
+    )
+
+    /// SHA-256 of config.json at the pinned revision (captured 2026-04-08).
+    private static let configIntegrityHash = "c546925585e48f43890d9dc5150df4fec73dd3780d92961c5ace451934cc4cd6"
 
     /// Where model files are cached on disk.
     /// ~/Library/Application Support/TextRefiner/models/
@@ -40,6 +49,29 @@ final class LocalInferenceService: @unchecked Sendable {
         guard fm.fileExists(atPath: modelDir.path) else { return false }
         let contents = (try? fm.contentsOfDirectory(atPath: modelDir.path)) ?? []
         return contents.contains { $0.hasSuffix(".safetensors") }
+    }
+
+    /// Verifies that config.json in the local model directory matches the pinned SHA-256.
+    /// Throws `integrityCheckFailed` and deletes the model directory if the hash doesn't match,
+    /// forcing a clean re-download on the next launch.
+    func verifyConfigIntegrity() throws {
+        let hub = HubApi(downloadBase: Self.modelCacheURL)
+        let modelDir = Self.modelConfiguration.modelDirectory(hub: hub)
+        let configURL = modelDir.appendingPathComponent("config.json")
+
+        guard let data = try? Data(contentsOf: configURL) else {
+            // config.json missing — model is incomplete; let the download path handle it
+            return
+        }
+
+        let digest = SHA256.hash(data: data)
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+
+        guard hex == Self.configIntegrityHash else {
+            // Hash mismatch — delete the model directory to force a clean re-download
+            try? FileManager.default.removeItem(at: Self.modelCacheURL)
+            throw InferenceError.integrityCheckFailed
+        }
     }
 
     /// Downloads the model from Hugging Face with progress reporting.
@@ -99,8 +131,16 @@ final class LocalInferenceService: @unchecked Sendable {
                         throw InferenceError.modelLoadFailed("Model container is nil after loading.")
                     }
 
+                    // Strip delimiter strings from clipboard content before injection —
+                    // prevents crafted clipboard text from breaking the prompt structure
+                    // or echoing delimiters into the output (prompt injection hardening).
+                    let sanitizedText = text
+                        .replacingOccurrences(of: "[TEXT_START]", with: "")
+                        .replacingOccurrences(of: "[TEXT_END]", with: "")
+                        .replacingOccurrences(of: "{{USER_TEXT}}", with: "")
+
                     // Inject user text into the template
-                    let fullPrompt = self.promptTemplate.replacingOccurrences(of: "{{USER_TEXT}}", with: text)
+                    let fullPrompt = self.promptTemplate.replacingOccurrences(of: "{{USER_TEXT}}", with: sanitizedText)
 
                     // Build chat messages — the tokenizer applies the model's chat template
                     let userInput = UserInput(
@@ -180,12 +220,14 @@ enum InferenceError: Error, LocalizedError {
     case modelNotDownloaded
     case modelLoadFailed(String)
     case generationFailed(String)
+    case integrityCheckFailed
 
     var errorDescription: String? {
         switch self {
         case .modelNotDownloaded: return "AI model not downloaded. Please restart TextRefiner to download it."
         case .modelLoadFailed(let msg): return "Failed to load AI model: \(msg)"
         case .generationFailed(let msg): return "Text generation failed: \(msg)"
+        case .integrityCheckFailed: return "AI model integrity check failed. The model files have been removed and will be re-downloaded on next launch."
         }
     }
 }

@@ -29,8 +29,32 @@ final class RefinementCoordinator {
     /// Fired on any other error (model not loaded, empty response, etc.)
     var onError: ((Error) -> Void)?
 
+    /// Maximum input length in characters (~2,000 words).
+    /// Inputs beyond this exceed the model's useful context window.
+    /// Referenced by TypingMonitor to hide the ready pill above this limit.
+    static let maxInputCharacters = 10_000
+
+    /// Fired when the user cancels a refinement in progress (Escape key).
+    /// Dismiss spinner/panel, no text replacement.
+    var onRefinementCancelled: (() -> Void)?
+
     /// Guards against double-trigger if user presses ⌘⇧R while already processing.
     private var isProcessing = false
+
+    /// Stored reference to the active refinement task so it can be cancelled.
+    private var refinementTask: Task<Void, Never>?
+
+    // MARK: - Cancel
+
+    /// Cancels the in-progress refinement immediately. No text is pasted.
+    /// Called when the user presses Escape during processing.
+    func cancelRefinement() {
+        guard isProcessing else { return }
+        refinementTask?.cancel()
+        refinementTask = nil
+        isProcessing = false
+        onRefinementCancelled?()
+    }
 
     // MARK: - Main Flow
 
@@ -46,7 +70,7 @@ final class RefinementCoordinator {
 
         isProcessing = true
 
-        Task { @MainActor in
+        refinementTask = Task { @MainActor in
             onProcessingStarted?()
 
             do {
@@ -57,6 +81,12 @@ final class RefinementCoordinator {
                     throw RefinementError.noTextSelected
                 }
 
+                try Task.checkCancellation()
+
+                guard selectedText.count <= Self.maxInputCharacters else {
+                    throw RefinementError.inputTooLong(selectedText.count)
+                }
+
                 // Step 2: Stream from local model on a BACKGROUND thread.
                 // This prevents the model loading / inference from blocking the main
                 // thread and freezing the entire Mac (especially on shared-memory M1).
@@ -65,6 +95,7 @@ final class RefinementCoordinator {
                     let stream = inferenceService.streamRewrite(text: selectedText)
 
                     for try await token in stream {
+                        try Task.checkCancellation()
                         accumulated += token
                     }
 
@@ -76,6 +107,8 @@ final class RefinementCoordinator {
                     // closing anchor, preamble, wrapping quotes) before pasting.
                     return inferenceService.cleanResponse(accumulated)
                 }.value
+
+                try Task.checkCancellation()
 
                 // Record to history (lightweight — just appends + writes JSON)
                 RefinementHistory.shared.add(
@@ -99,10 +132,14 @@ final class RefinementCoordinator {
                 // Step 5: Dismiss everything
                 onProcessingFinished?()
 
+            } catch is CancellationError {
+                // User pressed Escape — cancelRefinement() already handled UI cleanup.
+                // Nothing to do here; just exit silently.
             } catch {
                 onError?(error)
             }
 
+            refinementTask = nil
             isProcessing = false
         }
     }
@@ -111,11 +148,13 @@ final class RefinementCoordinator {
 enum RefinementError: Error, LocalizedError {
     case noTextSelected
     case emptyResponse
+    case inputTooLong(Int)
 
     var errorDescription: String? {
         switch self {
-        case .noTextSelected: return "No text selected. Highlight text and try again."
-        case .emptyResponse:  return "Model returned an empty response."
+        case .noTextSelected:         return "No text selected. Highlight text and try again."
+        case .emptyResponse:          return "Model returned an empty response."
+        case .inputTooLong(let count): return "Selected text is too long (\(count) characters). Please select 10,000 characters or fewer and try again."
         }
     }
 }

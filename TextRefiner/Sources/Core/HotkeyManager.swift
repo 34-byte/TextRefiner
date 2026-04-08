@@ -10,6 +10,11 @@ final class HotkeyManager {
     /// Called on the main thread when ⌘⇧R is pressed.
     var onHotkeyPressed: (() -> Void)?
 
+    /// Called on the main thread when Escape is pressed during processing.
+    /// Set to non-nil only while a refinement is in progress; nil otherwise
+    /// so Escape passes through to the frontmost app normally.
+    var onEscapePressed: (() -> Void)?
+
     /// True if the event tap is currently installed AND enabled by macOS.
     /// Checks the real enabled state — not just whether the tap object exists.
     /// A tap can exist (non-nil) but be temporarily disabled by macOS under load;
@@ -120,6 +125,16 @@ private func hotkeyCallback(
             manager.onHotkeyPressed?()
         }
         return nil // Consume the event — don't pass to frontmost app
+    }
+
+    // Escape key (keyCode 53) — cancel in-progress refinement.
+    // Only consume the event when onEscapePressed is set (i.e. processing is active).
+    // When nil, Escape passes through to the frontmost app normally.
+    if keyCode == 53, let escapeHandler = manager.onEscapePressed {
+        DispatchQueue.main.async {
+            escapeHandler()
+        }
+        return nil // Consume — don't let Escape reach the frontmost app
     }
 
     return Unmanaged.passRetained(event) // Pass through all other events

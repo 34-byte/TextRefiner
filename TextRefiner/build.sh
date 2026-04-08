@@ -154,6 +154,11 @@ for BUNDLE_PATH in "$BUILD_DIR/arm64-apple-macosx/release/"*.bundle; do
     fi
 done
 
+# --- Copy audio feedback files ---
+echo "==> Copying audio files..."
+cp "$SCRIPT_DIR/Success_Sound.mp3" "$RESOURCES_DIR/"
+cp "$SCRIPT_DIR/Fail_sound.mp3" "$RESOURCES_DIR/"
+
 # --- Embed Sparkle.framework ---
 FRAMEWORKS_DIR="$CONTENTS/Frameworks"
 SPARKLE_SOURCE="$BUILD_DIR/arm64-apple-macosx/release/Sparkle.framework"
