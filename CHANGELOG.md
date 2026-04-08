@@ -10,10 +10,11 @@ All production releases of TextRefiner. Newest first.
 - **Audio feedback** — A subtle sound plays when refinement succeeds or fails, so you always know the result without looking at the screen.
 - **Escape-to-cancel** — Press Escape while refinement is in progress to cancel instantly and restore your original text.
 - **Input length safeguard** — TextRefiner now caps inputs at 10,000 characters. Longer selections show a 5-second error message instead of processing.
-- **Hardened prompt injection defense** — Internal delimiter protection to prevent malicious text in your clipboard from breaking the refinement prompt.
+- **Encrypted refinement history** — Your history is now stored encrypted on disk. Existing history migrates automatically on first launch.
+- **Model integrity verification** — TextRefiner now verifies the AI model files haven't been tampered with before running inference. A corrupted or substituted model triggers a clean re-download.
 
-### Improvements
-- Refinement history no longer loses entries when the app updates.
+### Security
+- Hardened prompt injection defense to prevent malicious clipboard content from breaking the refinement prompt.
 
 ---
 
