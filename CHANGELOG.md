@@ -4,6 +4,21 @@ All production releases of TextRefiner. Newest first.
 
 ---
 
+## v1.2.0 — 2026-04-12
+
+### What's New
+- **Faster cancel** — Pressing Escape now stops the AI mid-sentence instead of waiting for it to finish. You get control back in 1–2 seconds.
+- **Safer paste** — If pasting fails for any reason, TextRefiner tells you the text is ready on your clipboard so you can paste it yourself.
+- **Loading timeout** — If the AI model can't load (bad connection, corrupted files), TextRefiner shows an error instead of spinning forever.
+
+### Improvements
+- The success checkmark and sound now feel simultaneous with your text changing on screen. Previously there was a brief moment where you'd see "done" before anything changed in your document.
+- Fixed a bug where pressing the hotkey twice very fast could load the AI model twice, doubling memory usage.
+- Hotkey listener cleanup is now more robust when changing shortcuts in Settings.
+- Instant paste — removed a leftover delay between refinement and the success checkmark.
+
+---
+
 ## v1.1.9 — 2026-04-08
 
 ### What's New

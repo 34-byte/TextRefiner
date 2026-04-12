@@ -151,9 +151,9 @@ Before every release (`./build.sh release`), run through this checklist on the d
 
 ---
 
-## Current State (v1.1.8)
+## Current State (v1.2.0)
 
-**v1.1 complete:**
+**v1.2 shipped:**
 - Settings window with hotkey configuration, launch on login, and developer rebuild button
 - Custom hotkey configuration (key-capture control, live CGEvent tap re-registration)
 - Launch on login toggle (SMAppService)
@@ -166,13 +166,14 @@ Before every release (`./build.sh release`), run through this checklist on the d
 - **Hotkey guardrails** — onboarding blocks on page 1 until the real CGEvent tap is confirmed created; any tap failure at any launch shows an immediate actionable alert
 - **Comprehensive hotkey hardening (v1.1.7)** — 21 stress-test scenarios fixed; all documented in `HOTKEY_STRESS_TEST.md`
 - **Accessibility registration fix (v1.1.8)** — proactive `AXIsProcessTrustedWithOptions` call ensures the app appears in Accessibility settings after every update
-
-**In progress (post-v1.1.8, not yet released):**
 - **Escape-to-cancel** — Escape key during processing cancels inference and restores the app to idle state; no text is pasted
 - **Input length limit** — 10,000 character cap enforced before inference; over-limit selections show a 5s error HUD (not an alert)
 - **Prompt injection hardening** — clipboard content stripped of delimiter strings before template injection
+- **Audio feedback** — success and failure sounds; failure sound removed from disk, now bundled as `.mov`
+- **Faster cancel + safer paste** — escape cancels mid-inference; failed paste shows clipboard-ready message
+- **Checkmark timing fix** — 60ms post-paste delay so success checkmark/sound land simultaneous with text replacement in the target app
 
-**v1.2 roadmap:** Tone-Adaptive Refinement (system prompt auto-detects text tone, no manual mode selection), polished HUD animations, instant paste, audio feedback, privacy messaging ("100% local"), performance optimization for M1/8GB baseline. Full specs in `TextRefiner_PRD_V2.txt`.
+**v1.3 roadmap:** Tone-Adaptive Refinement (system prompt auto-detects text tone, no manual mode selection), polished HUD animations, privacy messaging ("100% local"), performance optimization for M1/8GB baseline. Full specs in `TextRefiner_PRD_V2.txt`.
 
 ---
 
