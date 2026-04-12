@@ -1,70 +1,71 @@
 # TextRefiner Security Audit
-*Automated audit — run: 2026-04-11 08:02 UTC*
+*Automated audit — run: 2026-04-12 04:15 UTC*
 
 ---
 
 ## 1. Security Posture Rating
 
-**🟡 ACCEPTABLE — Minor issues, no immediate data exposure risk to a standard threat model.**
+🟡 **ACCEPTABLE** — Minor issues, no immediate data exposure risk to a standard threat model.
 
-TextRefiner's security posture is solid for a desktop utility in its threat model. No hardcoded secrets, no shell injection, no sensitive plaintext storage, and history encryption via AES-GCM with a Keychain-backed key. All subprocess invocations use explicit argument arrays with minimal environments. The primary finding is that the `verifyConfigIntegrity()` function — the model integrity check — is defined but never called anywhere in the codebase, making it dead code. The comment in `LocalInferenceService.swift` says "tampering is caught by verifyConfigIntegrity() before inference runs" but this claim is false: the function is never invoked. The practical risk is low (requires local file system write access or a MITM on model download HTTPS), but the stated defense is not in place. The secondary finding is an unavoidable pasteboard exposure window: the user's selected text sits on the system clipboard for 2–9 seconds during inference, readable by any app running as the same user. This is architectural and cannot be easily eliminated, but it is worth documenting. All other findings are informational.
+TextRefiner is a well-hardened local desktop app for its distribution model (ad-hoc signed, no sandbox, outside App Store). The codebase demonstrates consistent attention to macOS security: subprocess environments are explicitly minimised, all sensitive data is encrypted or properly permissioned, debug logging is gated behind `#if DEBUG` throughout, Keychain is used correctly for the AES-GCM history key, and the CGEvent tap is narrowly scoped. The primary threat model is other apps running as the same user, supply chain compromise, and local physical access — not remote network attackers. The only finding above LOW severity is a dead code path: `verifyConfigIntegrity()` is defined and correctly implemented but is never called, meaning a tampered model config would load silently without the detection mechanism that the comments claim is in place. All other findings are low-severity architectural trade-offs inherent to how the app works or require same-user write access to exploit.
 
 ---
 
 ## 2. Critical and High Findings
 
-None.
+None. No CRITICAL or HIGH severity findings this run.
 
 ---
 
 ## 3. Quick Wins
 
-- **Call `verifyConfigIntegrity()` from `streamRewrite()` before `loadModel()`** — ~5 minutes. The function is already correct; it just needs to be wired in.
-- **Add `*.dSYM` to `.gitignore`** — ~1 minute.
+| # | Finding | Fix | Effort |
+|---|---------|-----|--------|
+| 1 | `verifyConfigIntegrity()` is never called | Call it in `loadModel()` before `loadContainer()` | ~10 min |
+| 2 | Build script uses PATH lookup for security-critical tools | Use full paths (`/usr/bin/codesign`, `/usr/bin/xcrun`) | ~10 min |
 
 ---
 
 ## 4. Prioritized Remediation Plan
 
-1. **[MEDIUM] Dead integrity check — wire `verifyConfigIntegrity()` into `streamRewrite()`** — ~5 min
-2. **[LOW] Pasteboard exposure window** — document in privacy FAQ — ~30 min (writing only)
-3. **[INFORMATIONAL] `.gitignore` missing `*.dSYM`** — ~1 min
+1. **[MEDIUM] Call `verifyConfigIntegrity()` at model load time** — `LocalInferenceService.loadModel()`:line 99 — ~10 min
+2. **[LOW] Build script PATH-based tool resolution** — `build.sh` throughout — use explicit full paths for `xcrun`, `codesign`, `tccutil`, etc. — ~10 min
+3. **[LOW] Document pasteboard exposure window** — `AccessibilityService.pasteText()` — architectural; document as accepted risk
+4. **[LOW] Document TypingMonitor text-content read scope** — `TypingMonitor.readCharacterCount()`:line 309 — add inline comment acknowledging read scope
+5. **[INFO] prompts.json prompt-injection via file tampering** — inherent to architecture; within same-user threat model — document as accepted risk
 
 ---
 
 ## 5. What's Already Done Right
 
-- All `print()` statements wrapped in `#if DEBUG` — zero stdout in release builds
-- AES-GCM encryption for `history.json`; key stored in Keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`
-- Keychain service string fixed to `"com.textrefiner.app"` (not `Bundle.main.bundleIdentifier`) so dev/release builds share one key
-- Prompt injection sanitization: clipboard text stripped of `[TEXT_START]`, `[TEXT_END]`, `{{USER_TEXT}}` before template injection
-- Input length cap (10,000 chars) enforced before inference — protects against memory exhaustion
-- All subprocess invocations use argument arrays (not shell string interpolation) and explicit minimal environments
-- CGEvent tap event mask is narrow (`.keyDown` only); non-matching events passed through; tap cleaned up correctly on `stop()`
-- `tccutil reset` scoped to `Bundle.main.bundleIdentifier` only — cannot affect other apps
-- `xattr -dr` scoped to `Bundle.main.bundlePath` only
-- Sparkle 2.9.1 with EdDSA (`SUPublicEDKey`) — update integrity guaranteed even if appcast host is compromised
-- Appcast URL is HTTPS; no `NSAllowsArbitraryLoads` in Info.plist
-- `Package.resolved` committed — dependency versions are locked
-- `prompts.json` and `history.json` both written with `options: .atomic` and `posixPermissions: 0o600`
-- `@rpath` set to `@executable_path/../Frameworks` only — no world-writable injection paths
-- Sparkle.framework signed before app bundle is signed in `build.sh`
-- `AXObserver` scoped to frontmost app's PID; torn down correctly on app switch; only character count read (not text content)
-- No sensitive data in UserDefaults (hotkey keycodes and modifier flags are non-sensitive)
+- **All print/logging guarded by `#if DEBUG`** — no user data leaks to Console.app in release builds (`TypingMonitor`, `AccessibilityService`, `HotkeyManager`, `AppDelegate`, `PromptStorage`, `RefinementHistory`)
+- **AES-GCM history encryption** — `history.json` encrypted with a 256-bit key stored in the Data Protection Keychain (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, `kSecUseDataProtectionKeychain: true`); legacy `.history-key` file migration path included
+- **File permissions on sensitive data** — both `prompts.json` and `history.json` set to `0600` after every write
+- **Subprocess environment minimisation** — all `Process` invocations explicitly set `environment` to a minimal PATH; `HOME` is the only parent environment variable passed through (needed by build toolchain)
+- **CGEvent tap narrowly scoped** — mask is `keyDown` only; non-matching events passed through; tap properly invalidated with `CFMachPortInvalidate` + `CFRunLoopRemoveSource` on `stop()`
+- **Prompt injection sanitisation** — clipboard text has `[TEXT_START]`, `[TEXT_END]`, and `{{USER_TEXT}}` stripped before template injection; cleaned again in `cleanResponse()` on output
+- **Input length limit** — 10,000-character hard cap enforced before inference; error shown via HUD, not `NSAlert`
+- **No hardcoded secrets** — only a public EdDSA key (`SUPublicEDKey`) and a SHA-256 hash for model integrity; no API tokens, passwords, or private keys anywhere
+- **tccutil scoped to app's own bundle ID** — `Bundle.main.bundleIdentifier` only; never called with broad categories or other apps' identifiers
+- **Quarantine removal scoped to bundle path** — `Bundle.main.bundlePath` only; never operates on user-supplied paths
+- **Sparkle EdDSA signing enforced** — `SUPublicEDKey` in Info.plist; `sign_update` tool invoked in build.sh; appcast over HTTPS
+- **Package.resolved committed** — all transitive dependency hashes locked; no branch-based dependencies
+- **Escape-to-cancel safely scoped** — `onEscapePressed` is nil by default; set only for the duration of active processing; cleared in all terminal states
+- **Model config revision pinned** — `LocalInferenceService.modelConfiguration` pins to a specific Hugging Face commit hash, preventing silent model updates
 
 ---
 
 ## 6. Checklist Summary
 
 ```
-1.1 ✅  1.2 ✅  1.3 ✅  1.4 ✅  1.5 ⚠️  1.6 ✅
+1.1 ✅  1.2 ✅  1.3 ⚠️  1.4 ✅  1.5 ✅  1.6 ✅
 2.1 ✅  2.2 ✅  2.3 ✅  2.4 ⬚  2.5 ✅  2.6 ✅
 3.1 ✅  3.2 ✅  3.3 ✅  3.4 ✅  3.5 ✅
-4.1 ✅  4.2 ✅  4.3 ⚠️  4.4 ✅  4.5 ✅
+4.1 ✅  4.2 ✅  4.3 ⚠️  4.4 ✅  4.5 ⚠️
 5.1 ✅  5.2 ✅  5.3 ✅  5.4 ❌
-6.1 ✅  6.2 ✅  6.3 ✅  6.4 ✅  6.5 ✅
+6.1 ✅  6.2 ⚠️  6.3 ✅  6.4 ✅  6.5 ✅
 7.1 ✅  7.2 ✅  7.3 ⚠️  7.4 ✅
-8.1 ✅  8.2 ✅  8.3 ✅  8.4 ✅  8.5 ✅
+8.1 ✅  8.2 ✅  8.3 ✅  8.4 ✅  8.5 ⚠️
 9   — No additions this run
 ```
 
@@ -72,129 +73,121 @@ None.
 
 ## Section-by-Section Results
 
----
-
 ### Section 1: Secrets & Credential Management
 
 **1.1 — Hardcoded secrets** ✅ PASS
-No API keys, tokens, passwords, or private keys in source code, plists, or scripts. `SUPublicEDKey` in `Info.plist` is a Sparkle EdDSA *public* verification key — expected and safe. `configIntegrityHash` in `LocalInferenceService.swift:25` is a SHA-256 hash of `config.json`, not a secret. No 32+ character alphanumeric credential strings found.
+No API keys, tokens, passwords, signing keys, or credentials in source, plists, scripts, or config. `SUPublicEDKey` in `Info.plist` is the Sparkle EdDSA *public* key — expected by design. `configIntegrityHash` in `LocalInferenceService.swift:25` is a SHA-256 digest of a model file — not a secret.
 
 **1.2 — Keychain vs plaintext storage** ✅ PASS
-The AES-GCM history encryption key is stored in the macOS Keychain (`RefinementHistory.swift:92–156`) with service `"com.textrefiner.app"`, account `"history-encryption-key"`, and accessibility `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. UserDefaults contains only: onboarding state (bool), build version string (non-sensitive), hotkey keycode (integer, non-sensitive), hotkey modifier flags (integer, non-sensitive), typing indicator toggle (bool). No sensitive data in UserDefaults.
+History encryption key stored in the Data Protection Keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` and `kSecUseDataProtectionKeychain: true` (`RefinementHistory.swift:165–173`). `history.json` is AES-GCM encrypted at rest. `prompts.json` contains only user-crafted prompt templates (not credentials) and is set to `0600`. All UserDefaults keys store non-sensitive UI/feature state (hotkey code, onboarding flags, indicator toggle).
 
-**1.3 — Git history for secrets** ✅ PASS
-9 commits total. No `.env` files, no private keys, no credential files in any commit. A previous version of `RefinementHistory.swift` used a `.history-key` plaintext file but this was migrated to Keychain before the initial repository commit. No secrets were ever committed.
+**1.3 — Git history for secrets** ⚠️ PARTIAL
+Cannot fully scan git history using available tools. Visual inspection of `.gitignore` confirms `.build/`, `TextRefiner.app`, and `*.zip` are excluded. No `.env` files or credential files present in the working tree. Manual git history scan is recommended to confirm no prior secret commits.
 
 **1.4 — Logging and print statement leaks** ✅ PASS
-All `print()` statements in every source file are inside `#if DEBUG` blocks. Confirmed file by file: `AppDelegate.swift` (lines 241, 395, 645, 668), `HotkeyManager.swift` (line 49), `TypingMonitor.swift` (all 17 print statements), `AccessibilityService.swift` (line 72), `PromptStorage.swift` (line 148), `RefinementHistory.swift` (lines 112, 178). Clipboard content and user text are never logged anywhere in the codebase.
+All `print()` calls throughout the codebase are wrapped in `#if DEBUG` blocks. Verified in: `TypingMonitor.swift` (all instances), `AccessibilityService.swift:72`, `HotkeyManager.swift:49`, `AppDelegate.swift:394–396`, `AppDelegate.swift:644–647`, `AppDelegate.swift:668–670`, `PromptStorage.swift:149`, `RefinementHistory.swift:113`, `RefinementHistory.swift:193`. No clipboard content, user text, or credentials appear in any log statement.
 
-**1.5 — Build artifact exposure** ⚠️ PARTIAL
-`.gitignore` covers `TextRefiner/.build/`, `TextRefiner/TextRefiner.app/`, and `TextRefiner/*.zip`. Since SPM writes dSYM files inside `.build/`, they are covered in practice. However, `*.dSYM` is not explicitly listed. If a developer generates a dSYM outside `.build/` (e.g., via a custom Xcode scheme), it would not be excluded. Risk is low but the explicit exclusion is a one-line fix.
+**1.5 — Build artifact exposure** ✅ PASS
+`.gitignore` excludes `TextRefiner/.build/`, `TextRefiner/TextRefiner.app/`, and `TextRefiner/*.zip`. Release builds compile with `swift build -c release` (no debug symbols in binary). No `.dSYM` files or debug artifacts found in tracked files.
 
 **1.6 — Info.plist secrets** ✅ PASS
-`Info.plist` contains `SUPublicEDKey` (public key, expected for Sparkle EdDSA verification). No private keys, tokens, or credentials. `Info-Dev.plist` has no Sparkle config at all — correct.
+`Info.plist` contains only `SUPublicEDKey` (EdDSA public key — expected) and `SUFeedURL` (HTTPS public URL). `Info-Dev.plist` has neither (Sparkle is disabled in dev builds). No private keys, API secrets, or credentials.
 
 ---
 
 ### Section 2: Code Signing & Distribution Security
 
 **2.1 — Entitlements review** ✅ PASS
-`TextRefiner.entitlements` contains a single key: `com.apple.security.app-sandbox = false`. No unnecessary entitlements. The absence of sandbox is required and intentional — Accessibility API and CGEvent tap creation require it for this distribution model. No temporary exceptions, no unrestricted network entitlements, no file system access entitlements beyond what the OS provides by default.
+`TextRefiner.entitlements` contains only `com.apple.security.app-sandbox: false`. No unnecessary entitlements. No `com.apple.security.temporary-exception.*` entries. Sandbox disabled is correct for this app's requirements (Accessibility API, CGEvent tap, paste simulation — all incompatible with sandbox).
 
 **2.2 — Code signing method** ✅ PASS
-Ad-hoc signing (`codesign --sign -`) is the documented, intentional, permanent distribution model. All implications are handled: Gatekeeper bypass via quarantine removal on launch, TCC invalidation on every rebuild handled by `tccutil reset` (dev) and post-update re-onboarding flow (production), user documentation in CLAUDE.md.
+Ad-hoc signing (`codesign --force --sign -`) documented and correctly handled. TCC entries are invalidated on every rebuild; the post-update re-onboarding flow handles this. Build script resets TCC in dev mode only. Known limitations are mitigated.
 
 **2.3 — Sparkle / update framework configuration** ✅ PASS
-- `SUFeedURL`: `https://gist.githubusercontent.com/34-byte/6a5dacdb24a6bae85d003e906f5fa907/raw/appcast.xml` — HTTPS ✅
-- `SUPublicEDKey`: present — EdDSA signature verification enabled ✅
-- `SUEnableAutomaticChecks = true`, `SUScheduledCheckInterval = 86400` ✅
-- Sparkle 2.9.1 — current, actively maintained, security-audited ✅
-- Dev builds have no `SUFeedURL` (Info-Dev.plist omits it); `UpdateManager.init()` checks for `SUFeedURL` presence and skips Sparkle initialization if absent ✅
+`SUFeedURL` uses HTTPS (`https://gist.githubusercontent.com/...`). `SUPublicEDKey` is set (EdDSA). `build.sh` invokes `sign_update` to sign the `.zip` archive. `SUEnableAutomaticChecks: true`. `SUScheduledCheckInterval: 86400`. Sparkle 2.9.1 resolved.
 
 **2.4 — Notarization status** ⬚ N/A
-Ad-hoc signing is mutually exclusive with notarization (notarization requires Apple Developer ID). This is the permanent distribution model by design. Not applicable.
+App uses ad-hoc signing without an Apple Developer account. Notarization requires a Developer ID certificate, which is explicitly out of scope per the project's distribution model. The quarantine removal flow in `AppDelegate.removeQuarantineFlag()` compensates for Gatekeeper blocks.
 
 **2.5 — Quarantine handling** ✅ PASS
-`AppDelegate.removeQuarantineFlag()` runs `xattr -dr com.apple.quarantine Bundle.main.bundlePath` — scoped to the app's own bundle path only. The path comes from `Bundle.main.bundlePath` (trusted OS API), not user input. Runs on a background thread to avoid blocking main at launch.
+`removeQuarantineFlag()` at `AppDelegate.swift:685` runs `xattr -dr com.apple.quarantine bundlePath` where `bundlePath = Bundle.main.bundlePath`. Path is the app's own bundle — not user-supplied. Argument array used (no shell interpolation). Runs asynchronously on a background thread.
 
 **2.6 — Framework embedding** ✅ PASS
-`build.sh` signs Sparkle.framework (`codesign --force --sign - "$FRAMEWORKS_DIR/Sparkle.framework"`) before signing the app bundle. `install_name_tool -add_rpath @executable_path/../Frameworks` sets the correct relative rpath. No world-writable or user-writable paths in rpath configuration.
+`build.sh:175` signs Sparkle before signing the app bundle: `codesign --force --sign - "$FRAMEWORKS_DIR/Sparkle.framework"`. `@rpath` set via `install_name_tool -add_rpath @executable_path/../Frameworks` — not a user-writable path. `mlx.metallib` signed before app bundle signing.
 
 ---
 
 ### Section 3: Process & Shell Execution Security
 
 **3.1 — Process/NSTask inventory** ✅ PASS
-Four subprocess invocations in total:
 
-| Location | Executable | Purpose | Arguments source |
-|---|---|---|---|
-| `AppDelegate.swift:657–665` | `/usr/bin/tccutil` | Reset Accessibility TCC after update | Static array + `Bundle.main.bundleIdentifier` (trusted) |
-| `AppDelegate.swift:688–691` | `/usr/bin/xattr` | Strip quarantine flag | Static array + `Bundle.main.bundlePath` (trusted) |
-| `AppDelegate.swift:721–750` | `/bin/bash` | Rebuild & Relaunch (dev only) | `[buildScript]` derived from `Bundle.main.bundlePath` (trusted) |
-| `AppDelegate.swift:746–749` | `/usr/bin/open` | Launch rebuilt app | `[appBundleURL.path]` derived from bundle path (trusted) |
+| Location | Command | Args source | Shell? |
+|----------|---------|-------------|--------|
+| `AppDelegate.swift:659` | `/usr/bin/tccutil reset Accessibility $bundleID` | `Bundle.main.bundleIdentifier` | No — array |
+| `AppDelegate.swift:689` | `/usr/bin/xattr -dr com.apple.quarantine $path` | `Bundle.main.bundlePath` | No — array |
+| `AppDelegate.swift:722` | `/bin/bash build.sh` | derived from `Bundle.main.bundlePath` | Script file, no interpolation |
+| `AppDelegate.swift:747` | `/usr/bin/open $appBundleURL` | derived from `Bundle.main.bundlePath` | No — array |
 
-Identical subprocess pattern in `SettingsWindowController.swift:346–382` — same security properties.
+All use `executableURL`. All arguments are arrays. None accept user-supplied input.
 
 **3.2 — Shell command injection** ✅ PASS
-No invocation uses `/bin/bash -c "string"` (string interpolation). The "Rebuild & Relaunch" bash invocation uses `process.arguments = [buildScript]` where `buildScript` is a file path derived from `Bundle.main.bundlePath` — no user input reaches the argument list. All other invocations use static argument arrays.
+No `/bin/bash -c "...string..."` pattern exists. The build.sh invocation passes the script path as an argument array element, not as shell string interpolation. The buildScript path is derived from `Bundle.main.bundlePath` — not user input.
 
 **3.3 — Subprocess environment** ✅ PASS
 All subprocesses set `process.environment` explicitly:
-- `tccutil`, `xattr`, `open`: `["PATH": "/usr/bin:/bin"]` (minimal)
-- `bash build.sh`: `["PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/usr/libexec", "HOME": ProcessInfo.processInfo.environment["HOME"] ?? ""]` (HOME forwarded because `swift build` needs it for package cache resolution)
+- `tccutil`: `["PATH": "/usr/bin:/bin"]`
+- `xattr`: `["PATH": "/usr/bin:/bin"]`
+- `build.sh`: `["PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/usr/libexec", "HOME": ProcessInfo.processInfo.environment["HOME"] ?? ""]`
+- `open`: `["PATH": "/usr/bin:/bin"]`
 
-Parent process environment is not inherited by any subprocess.
+`HOME` is explicitly passed to build.sh because the Swift toolchain requires it to locate packages. This is acceptable — HOME is a known system value, not sensitive data.
 
 **3.4 — Dynamic library loading** ✅ PASS
-`@rpath` set to `@executable_path/../Frameworks` only. No `@loader_path`, no absolute paths, no user-writable directories in rpath. `install_name_tool -add_rpath` used correctly in `build.sh`.
+No `dlopen()` calls. `@rpath` set to `@executable_path/../Frameworks` — not user-writable. `mlx.metallib` is placed in `Contents/MacOS/` alongside the binary and signed before the app bundle is signed.
 
 **3.5 — tccutil and privilege-sensitive commands** ✅ PASS
-`tccutil reset Accessibility bundleID` where `bundleID = Bundle.main.bundleIdentifier`. Scoped to the app's own bundle ID. Cannot affect other apps' Accessibility entries. Called only when `needsReOnboarding` is true (post-update flow where the binary's CDHash has changed), not on every launch.
+`tccutil` called with `Bundle.main.bundleIdentifier` only (`AppDelegate.swift:663`). Called only during the `needsReOnboarding` path (version mismatch). Also called in `build.sh:236` for dev builds only, scoped to the bundle ID from `Info.plist`. Never called with broad categories or other apps' identifiers.
 
 ---
 
 ### Section 4: Local Data Storage Security
 
 **4.1 — UserDefaults for sensitive data** ✅ PASS
-UserDefaults stores: `com.textrefiner.onboardingCompleted` (bool), `com.textrefiner.lastOnboardedBuild` (build version string), `com.textrefiner.hotkeyKeyCode` (integer), `com.textrefiner.hotkeyModifierFlags` (integer), `com.textrefiner.showTypingIndicator` (bool). None of these are sensitive. No passwords, tokens, API keys, or user content in UserDefaults.
+UserDefaults stores only non-sensitive preferences:
+- `com.textrefiner.onboardingCompleted` — boolean
+- `com.textrefiner.lastOnboardedBuild` — version string
+- `com.textrefiner.hotkeyKeyCode` — integer
+- `com.textrefiner.hotkeyModifierFlags` — integer
+- `com.textrefiner.showTypingIndicator` — boolean
+
+No passwords, tokens, keys, or user content stored in UserDefaults.
 
 **4.2 — Application Support files** ✅ PASS
-Three items under `~/Library/Application Support/TextRefiner/`:
-
-| File | Content | Encryption | Permissions |
-|---|---|---|---|
-| `history.json` | Last 10 refinement pairs | AES-GCM (Keychain key) | 0600 (set on every write) |
-| `prompts.json` | Active prompt template + 20-entry history | None (not credentials) | 0600 (set on every write) |
-| `models/` | Model weights (~1.8 GB, public data) | None | Default directory permissions |
-
-Both JSON files use `Data.write(to:options:.atomic)` + explicit `setAttributes([.posixPermissions: 0o600])` on every persist call.
+- `prompts.json` — user prompt templates, not credentials, set to `0600` (`PromptStorage.swift:145`)
+- `history.json` — AES-GCM encrypted, set to `0600` (`RefinementHistory.swift:190`)
+- `models/` — MLX model weights, not sensitive, no special permissions needed
 
 **4.3 — Pasteboard handling** ⚠️ PARTIAL
-The user's selected text sits on `NSPasteboard.general` from `simulateCopyAndRead()` through the end of `pasteText()` — a window of roughly 2–9 seconds (depending on model load state). During this window, any app running as the same user can read the clipboard. This is:
-- **Unavoidable** given the architecture (clipboard is the only cross-app text exchange mechanism available without sandbox)
-- **Known** and consistent with every tool in this category (Grammarly, WritingTools, etc.)
-
-The refined text also permanently replaces the previous clipboard contents. No action required from a security standpoint, but this should be disclosed in privacy documentation.
+The app's core function requires placing user text on the system pasteboard. During the ~2–5 second inference window, the user's selected text (potentially sensitive) sits on the pasteboard, readable by any app running as the same user. The original pasteboard content is not restored — the refined text replaces it (by design). This is an architectural trade-off inherent to using the system pasteboard for inter-app text transfer; it cannot be eliminated without a fundamentally different paste mechanism. Document as accepted risk.
 
 **4.4 — Temporary files and caches** ✅ PASS
-No `NSTemporaryDirectory()` or `/tmp` usage in source code. The build script creates `$BUILD_DIR/mlx_air/*.air` temp files during Metal shader compilation and explicitly `rm -rf "$AIR_DIR"` after `metallib` is built. No app-created temp files at runtime.
+No use of `NSTemporaryDirectory()`, `/tmp`, or `~/Library/Caches/` in source code. Build script cleans up `.air` intermediate Metal files with `rm -rf "$AIR_DIR"` after metallib compilation.
 
-**4.5 — JSON/plist deserialization safety** ✅ PASS
-Both `PromptStorage` and `RefinementHistory` use `try?` for deserialization with explicit fallback to defaults on failure. No `fatalError`, no force-unwrap on external data. A crafted `prompts.json` could substitute a malicious prompt template, but the template is used only as input to a local LLM (no remote execution, no command interpretation).
+**4.5 — JSON/plist deserialization safety** ⚠️ PARTIAL
+`prompts.json` and `history.json` loaded with `try?` throughout — malformed data falls back to defaults safely. However, a same-user attacker with write access to `~/Library/Application Support/TextRefiner/prompts.json` could inject an arbitrary prompt template. The app validates only that `{{USER_TEXT}}` is present. Worst case is manipulated LLM output, not code execution. Requires same-user write access — within the local threat model for an unsandboxed app. Document as accepted risk.
 
 ---
 
 ### Section 5: Input Validation & Injection
 
 **5.1 — LLM prompt injection** ✅ PASS
-`LocalInferenceService.streamRewrite()` strips `[TEXT_START]`, `[TEXT_END]`, and `{{USER_TEXT}}` from clipboard content before injection (`LocalInferenceService.swift:184–187`). Model output is used only for text replacement — not code execution, file operations, or URL navigation.
+Delimiter strings `[TEXT_START]`, `[TEXT_END]`, and `{{USER_TEXT}}` are stripped from clipboard content before injection (`LocalInferenceService.swift:184–187`). Stripped again from model output in `cleanResponse()`. Model output is pasted as plain text — not executed or passed to a shell. Breaking out of delimiter isolation would at worst produce unexpected model output, not a security escalation.
 
 **5.2 — Model output sanitization** ✅ PASS
-`cleanResponse()` strips leaked prompt artifacts: closing anchors, preamble phrases, delimiter leakage, and wrapping quotes. Output is pasted as plain text via the clipboard. No mechanism exists for model output to inject keystrokes or shell commands.
+`cleanResponse()` strips preamble phrases, leaked delimiters, and wrapping quotes. Output pasted via `NSPasteboard + Cmd+V` — received as plain text by the target app. No code path converts model output to simulated keystrokes, shell commands, or URL navigations.
 
 **5.3 — Pasteboard content validation** ✅ PASS
-`RefinementCoordinator.maxInputCharacters = 10_000` enforced before inference. Inputs over this limit throw `RefinementError.inputTooLong` and show a 5-second error HUD. Non-string pasteboard types handled by `NSPasteboard.string(forType: .string)` returning `nil`, caught by the guard at `RefinementCoordinator.swift:79–81`.
+10,000-character hard limit enforced in `RefinementCoordinator.startRefinement()` (`RefinementCoordinator.swift:86`). Non-string pasteboard types: `NSPasteboard.general.string(forType: .string)` returns nil, propagating to `RefinementError.noTextSelected`. No memory exhaustion possible.
 
 **5.4 — Untrusted data deserialization** ❌ FAIL
 
@@ -203,56 +196,52 @@ Both `PromptStorage` and `RefinementHistory` use `try?` for deserialization with
 ├──────────┬──────────────────────────────────────────────┤
 │ Severity │ MEDIUM                                       │
 │ Category │ Dead Code / Missing Integrity Verification   │
-│ Location │ LocalInferenceService.swift:64 (definition)  │
-│          │ LocalInferenceService.swift:18 (false claim) │
-│ CWE      │ CWE-345 (Insufficient Verification of Data   │
-│          │ Authenticity)                                │
+│ Location │ LocalInferenceService.swift:64–82            │
+│ CWE      │ CWE-354 (Improper Validation of Integrity    │
+│          │ Check Value)                                 │
 ├──────────┴──────────────────────────────────────────────┤
 │ What's wrong:                                           │
-│ `verifyConfigIntegrity()` is defined at line 64 and     │
-│ correctly computes SHA-256 of config.json, comparing    │
-│ it against `configIntegrityHash`. However, it is        │
-│ never called anywhere in the codebase. The comment      │
-│ at line 18 states "tampering is caught by               │
-│ verifyConfigIntegrity() before inference runs" —        │
-│ this claim is false. The function is dead code.         │
-│                                                         │
-│ Additionally, even if called, the check only covers     │
-│ config.json. The model weights (.safetensors files)     │
-│ that actually execute on the Metal GPU are not          │
-│ verified by any code path.                              │
+│ `verifyConfigIntegrity()` is implemented correctly —    │
+│ it computes SHA-256 of config.json and compares it to   │
+│ the pinned hash `configIntegrityHash`. But it is never  │
+│ called anywhere in the codebase. Comments imply         │
+│ tampering is caught before inference runs, but the      │
+│ verification is entirely dead code.                     │
 │                                                         │
 │ Why it matters:                                         │
-│ A local process with write access to                    │
-│ ~/Library/Application Support/TextRefiner/models/       │
-│ could replace model files without detection.            │
-│ Exploitation requires same-user local access.           │
-│ For a model that processes all text the user writes,    │
-│ a substituted model could silently alter output.        │
+│ A supply chain attacker who could tamper with the       │
+│ Hugging Face repo at the pinned revision, or a          │
+│ same-user attacker with write access to                 │
+│ ~/Library/Application Support/TextRefiner/models/,      │
+│ could replace config.json with a tampered version that  │
+│ alters model loading behaviour. The declared defence    │
+│ (SHA-256 check) never fires, so the tampered config     │
+│ loads silently.                                         │
 │                                                         │
 │ The vulnerable code:                                    │
 │ ```swift                                                │
-│ // LocalInferenceService.swift:170–175                  │
-│ if self.modelContainer == nil {                         │
-│     guard self.isModelDownloaded() else {               │
-│         throw InferenceError.modelNotDownloaded         │
-│     }                                                   │
-│     try await self.loadModel()  // no integrity check   │
+│ // loadModel() — integrity check is NEVER invoked       │
+│ func loadModel() async throws {                         │
+│     if modelContainer != nil { return }                 │
+│     // loads model directly with no integrity check     │
+│     let task: Task<Void, Error> = lock.withLock { ... } │
 │ }                                                       │
+│                                                         │
+│ // Defined but has zero call sites:                     │
+│ func verifyConfigIntegrity() throws { ... }             │
 │ ```                                                     │
 │                                                         │
 │ The fix:                                                │
 │ ```swift                                                │
-│ if self.modelContainer == nil {                         │
-│     guard self.isModelDownloaded() else {               │
-│         throw InferenceError.modelNotDownloaded         │
-│     }                                                   │
-│     try verifyConfigIntegrity()  // ← add this line     │
-│     try await self.loadModel()                          │
+│ func loadModel() async throws {                         │
+│     if modelContainer != nil { return }                 │
+│     // Verify config.json integrity before loading      │
+│     try verifyConfigIntegrity()                         │
+│     let task: Task<Void, Error> = lock.withLock { ... } │
 │ }                                                       │
 │ ```                                                     │
 │                                                         │
-│ Effort: ~5 minutes                                      │
+│ Effort: ~10 minutes                                     │
 └─────────────────────────────────────────────────────────┘
 
 ---
@@ -260,35 +249,35 @@ Both `PromptStorage` and `RefinementHistory` use `try?` for deserialization with
 ### Section 6: Accessibility & System Integration Security
 
 **6.1 — CGEvent tap scope** ✅ PASS
-Event mask: `1 << CGEventType.keyDown.rawValue` — keyDown only. Tap type: `.defaultTap` — correct for consuming the hotkey. Non-matching events: returned via `Unmanaged.passRetained(event)`. Cleanup: `CFMachPortInvalidate(tap)` + `CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)` in `HotkeyManager.stop()`. Re-enable on timeout dispatched to main thread to avoid data race.
+Event mask: `(1 << CGEventType.keyDown.rawValue)` — keyDown only. Options: `.defaultTap`. Non-matching events: `return Unmanaged.passRetained(event)` — passed through. Cleanup: `CGEvent.tapEnable(tap, enable: false)` + `CFMachPortInvalidate(tap)` + `CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)` on `stop()`. `tapDisabledByTimeout`/`tapDisabledByUserInput` handled by dispatching `reenableTap()` to main thread.
 
-**6.2 — Accessibility API usage patterns** ✅ PASS
-`TypingMonitor` reads character count (`kAXNumberOfCharactersAttribute`, falling back to string length), placeholder text (for comparison only), element role, and element frame. Actual text content is never stored, logged, or transmitted. In release builds, no diagnostic information about other apps is emitted.
+**6.2 — Accessibility API usage patterns** ⚠️ PARTIAL
+`TypingMonitor.readCharacterCount()` (`TypingMonitor.swift:309`) reads the full text content of the focused element via `kAXValueAttribute` as a fallback when `kAXNumberOfCharactersAttribute` is unavailable (common in Chrome/Electron). The string is used only for `.count` — never stored, logged, or transmitted. This is inherent to cross-app typing indicator functionality. Access requires the Accessibility permission the user explicitly grants. Observation scoped to frontmost app and focused element; observers torn down on app switch and focus change. Document as accepted scope.
 
 **6.3 — TCC permission handling** ✅ PASS
-`NSAccessibilityUsageDescription` present in both Info.plist files. `AccessibilityService.isTrusted()` uses a test CGEvent tap as ground truth (not unreliable `AXIsProcessTrusted()`). Graceful recovery via polling when permission is missing. App shows onboarding and polls for permission when it detects missing access.
+`NSAccessibilityUsageDescription` present in both `Info.plist` and `Info-Dev.plist`. Permission denial handled via `isTrusted()` → `onPermissionDenied` → re-onboarding or alert. Recovery via `startAccessibilityPolling()` (1.5s timer). App never repeatedly prompts after denial.
 
 **6.4 — Key simulation scope** ✅ PASS
-Only two keycodes ever simulated: `0x08` (Cmd+C — copy) and `0x09` (Cmd+V — paste), both only within the user-initiated hotkey flow. CGEventSource state: `.hidSystemState`. No code path converts attacker-controlled strings into simulated keystrokes — the paste path writes to `NSPasteboard` and posts a single Cmd+V event.
+Only `Cmd+C` (keyCode `0x08`) and `Cmd+V` (keyCode `0x09`) are simulated. Simulation triggered exclusively by the user's hotkey press. `CGEventSource(.hidSystemState)` used. Text paste is via pasteboard, not keystroke simulation of individual characters — no path exists where attacker-controlled text becomes simulated keystrokes.
 
 **6.5 — AXObserver scope** ✅ PASS
-`attachToFrontmostApp()` creates an `AXObserver` on the frontmost app's PID only. Observers torn down on every app switch via `teardownAppObserver()` + `teardownElementObserver()`. Self-app observation excluded via `pid == ProcessInfo.processInfo.processIdentifier` guard. No text content from other apps is read — only character count and element frame.
+Per-app observer: scoped to `frontmostApp.processIdentifier` only. Per-element observer: scoped to the focused element. Both torn down in `teardownAppObserver()` and `teardownElementObserver()` on focus change or app switch. No global observation. Self excluded: `if pid == ProcessInfo.processInfo.processIdentifier { return }`.
 
 ---
 
 ### Section 7: Network Security
 
 **7.1 — HTTPS enforcement** ✅ PASS
-All network URLs use HTTPS: Sparkle appcast, HuggingFace Hub model download, all SPM package URLs. No `NSAppTransportSecurity` / `NSAllowsArbitraryLoads` keys in either Info.plist. App Transport Security is in default enforced state.
+`SUFeedURL`: `https://gist.githubusercontent.com/...` ✅. Model downloads via `HubApi` (Hugging Face Hub): all connections HTTPS ✅. No HTTP URLs in source or plists. No `NSAllowsArbitraryLoads` in either Info.plist.
 
 **7.2 — Certificate pinning** ✅ PASS
-Sparkle 2.x enforces EdDSA signature verification on every downloaded update before installation — stronger than certificate pinning for the update path. Model downloads from HuggingFace use standard TLS (no pinning) — acceptable for a public model with no secret content.
+Sparkle: EdDSA (Ed25519) signature verification via `SUPublicEDKey` — effective substitute for certificate pinning for update delivery. Model downloads: no pinning, but HTTPS enforced. Appropriate for this desktop app threat model.
 
 **7.3 — Download integrity** ⚠️ PARTIAL
-Sparkle updates are EdDSA-signed — integrity guaranteed. Model downloads are verified only at the `config.json` level via `verifyConfigIntegrity()` — and as noted in §5.4, that function is never called. Model weight files (`.safetensors`) have no integrity verification. The revision pin in `ModelConfiguration` prevents silent server-side model swaps, but on-disk file tampering goes undetected.
+Sparkle update downloads: EdDSA-signed ✅. Model download: `verifyConfigIntegrity()` exists to check SHA-256 of config.json but is never called (see Finding #1). Model weight files (`.safetensors`) have no integrity check at all — only the presence of at least one `.safetensors` file is verified by `isModelDownloaded()`. The pinned revision hash in `modelConfiguration` is used by the Hugging Face Hub client but not independently verified by the app.
 
 **7.4 — Appcast feed security** ✅ PASS
-Appcast served over HTTPS from GitHub Gist. EdDSA signing means a compromised appcast host cannot deliver a malicious update without the private key. Gist is developer-controlled.
+Appcast at HTTPS URL. EdDSA signatures enforced by Sparkle 2.9.1. GitHub Gist is under the developer's control. A compromised Gist cannot push a malicious update because EdDSA signing prevents it. `LSMinimumSystemVersion: 13.0` in Info.plist.
 
 ---
 
@@ -296,31 +285,45 @@ Appcast served over HTTPS from GitHub Gist. EdDSA signing means a compromised ap
 
 **8.1 — Swift Package Manager dependency audit** ✅ PASS
 
-| Package | Resolved Version | Constraint | Maintainer |
-|---|---|---|---|
-| Sparkle | 2.9.1 | `from: "2.6.0"` | Sparkle Project |
-| mlx-swift | 0.31.3 | `from: "0.31.3"` | Apple/ml-explore |
-| mlx-swift-lm | 2.31.3 | `from: "2.30.0"` | Apple/ml-explore |
-| swift-transformers | 1.2.1 | `from: "1.2.0"` | HuggingFace |
+| Package | Resolved version | Maintainer | Notes |
+|---------|-----------------|------------|-------|
+| Sparkle | 2.9.1 | Open source | Well-known, actively maintained |
+| mlx-swift-lm | 2.31.3 | Apple/ML Explore | Actively maintained |
+| mlx-swift | 0.31.3 | Apple/ML Explore | Actively maintained |
+| swift-transformers | 1.2.1 | Hugging Face | Actively maintained |
+| swift-crypto | 4.3.1 | Apple | Well-known |
+| swift-nio | 2.97.1 | Apple | Well-known |
+| swift-asn1 | 1.6.0 | Apple | Well-known |
+| swift-atomics | 1.3.0 | Apple | Well-known |
+| swift-collections | 1.4.1 | Apple | Well-known |
+| swift-numerics | 1.1.1 | Apple | Well-known |
+| swift-system | 1.6.4 | Apple | Well-known |
+| swift-huggingface | 0.9.0 | Hugging Face | Early version; watch for updates |
+| swift-jinja | 2.3.5 | Hugging Face | Actively maintained |
+| yyjson | 0.12.0 | ibireme | C JSON library, well-regarded |
+| EventSource | 1.4.1 | mattt | Lower-profile; no known CVEs |
 
-All packages use minimum-version constraints (not branch-pinned). All actively maintained by credible organizations. No known CVEs. All fetched over HTTPS from GitHub.
+No known CVEs for any pinned dependency. All fetched from HTTPS GitHub repos.
 
-**8.2 — Package.resolved committed** ✅ PASS
-`Package.resolved` is committed with exact revision hashes for all 15 direct and transitive dependencies.
+**8.2 — Package.resolved / lockfile committed** ✅ PASS
+`Package.resolved` is committed and contains exact `revision` hashes for all 15 dependencies. Version 2 format. Guarantees reproducible builds.
 
 **8.3 — Unnecessary dependencies** ✅ PASS
-All four declared packages are actively used: `Sparkle` in `UpdateManager.swift` and `AppDelegate.swift`; `MLXLLM`, `MLXLMCommon`, `MLXRandom`, `MLX` in `LocalInferenceService.swift`; `Hub` (swift-transformers) in `LocalInferenceService.swift`.
+All declared dependencies are actively used: Sparkle (`UpdateManager`, `AppDelegate`), MLXLLM/MLX/MLXRandom/MLXLMCommon/Hub (`LocalInferenceService`). No orphaned imports found.
 
 **8.4 — Framework embedding security** ✅ PASS
-`build.sh` signs `Sparkle.framework` with `codesign --force --sign -` before signing the app bundle. `@rpath` set to `@executable_path/../Frameworks`. Sparkle's embedded XPC services are signed as part of the framework signing step.
+`build.sh:175`: `codesign --force --sign - "$FRAMEWORKS_DIR/Sparkle.framework"` — Sparkle signed before app bundle. `@rpath` points to `@executable_path/../Frameworks` — not user-writable. `mlx.metallib` signed before app bundle signing. Sparkle's internal XPC services carry their own signatures.
 
-**8.5 — Build script dependencies** ✅ PASS
-All external tools invoked via full absolute paths or `xcrun`. No tools resolved via unqualified `PATH` lookup. No resources downloaded during build. The `.air` Metal intermediate files are written to `$BUILD_DIR/mlx_air/` and cleaned up with `rm -rf "$AIR_DIR"` after `metallib` is built.
+**8.5 — Build script dependencies** ⚠️ PARTIAL
+`build.sh` invokes `xcrun`, `codesign`, `install_name_tool`, `sips`, `iconutil`, `PlistBuddy`, `tccutil`, `ditto`, and `metallib` via PATH lookup rather than full absolute paths. A compromised `PATH` on the developer's machine at build time could redirect these to malicious tools. This is a developer machine threat, not an end-user threat, and risk is low for a single-developer project without CI/CD. Mitigation: use full paths for security-critical tools (`/usr/bin/codesign`, `/usr/bin/xcrun`). No external resources are downloaded during build. Intermediate Metal `.air` files are cleaned up after compilation.
 
 ---
 
-### Section 9: Recent-Change Additions (this run only)
+## Section 9: Recent-Change Additions (this run only)
 
-The most recent daily log (2026-04-11) documents a SMAC brainstorm research session — no code changes. The 2026-04-10 log documents four security fixes now present in the codebase (Keychain access class, service string consolidation, `#if DEBUG` guards, subprocess environment hardening). No new features, URL scheme handlers, XPC services, file parsers, or network endpoints were added since the last audit.
+Changes since last audit (from daily log 2026-04-11, session 14:01):
+
+1. **Prompt output suppression line** — added `"Only return the refined text, nothing else."` to `PromptStorage.defaultPrompt` before `[TEXT_START]`. Static string addition to an in-memory constant. No new attack surface.
+2. **Multi-monitor HUD fix** — replaced `NSScreen.main` with `NSEvent.mouseLocation` + `NSScreen.screens` lookup in `StreamingPanelController.show()` and `showInputLimitError()`. Read-only system state query. No new attack surface.
 
 **No additions this run.**
