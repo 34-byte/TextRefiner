@@ -2,37 +2,37 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key>
-    <string>TextRefiner</string>
-    <key>CFBundleDisplayName</key>
-    <string>TextRefiner</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.textrefiner.app</string>
-    <key>CFBundleVersion</key>
-    <string>21</string>
-    <key>CFBundleShortVersionString</key>
-    <string>1.2.0</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleExecutable</key>
-    <string>TextRefiner</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
-    <key>LSUIElement</key>
-    <true/>
-    <key>NSAccessibilityUsageDescription</key>
-    <string>TextRefiner needs Accessibility access to read and replace selected text in other apps.</string>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-    <key>SUFeedURL</key>
-    <string>https://gist.githubusercontent.com/34-byte/6a5dacdb24a6bae85d003e906f5fa907/raw/appcast.xml</string>
-    <key>SUPublicEDKey</key>
-    <string>P9AXPluTwv6uB5JYvou3vFpB6d16Ov8zTbt5SHB9sEo=</string>
-    <key>SUEnableAutomaticChecks</key>
-    <true/>
-    <key>SUScheduledCheckInterval</key>
-    <integer>86400</integer>
+	<key>CFBundleDisplayName</key>
+	<string>TextRefiner</string>
+	<key>CFBundleExecutable</key>
+	<string>TextRefiner</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.textrefiner.app</string>
+	<key>CFBundleName</key>
+	<string>TextRefiner</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.3.0</string>
+	<key>CFBundleVersion</key>
+	<string>22</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>15.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSAccessibilityUsageDescription</key>
+	<string>TextRefiner needs Accessibility access to read and replace selected text in other apps.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUFeedURL</key>
+	<string>https://gist.githubusercontent.com/34-byte/6a5dacdb24a6bae85d003e906f5fa907/raw/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>P9AXPluTwv6uB5JYvou3vFpB6d16Ov8zTbt5SHB9sEo=</string>
+	<key>SUScheduledCheckInterval</key>
+	<integer>3600</integer>
 </dict>
 </plist>

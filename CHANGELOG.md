@@ -4,6 +4,20 @@ All production releases of TextRefiner. Newest first.
 
 ---
 
+## v1.3.0 — 2026-04-14
+
+### What's New
+- **Smarter HUD** — The floating indicator now tracks your text field in real time, so the progress animation appears exactly where you're working instead of a fixed position on screen.
+- **Polished animations** — The HUD expands and collapses with smooth easing. The checkmark and spinner fade in with a staggered timing that feels noticeably more refined.
+- **Inference timeout** — If the AI takes longer than 60 seconds, TextRefiner cancels and shows an error instead of hanging indefinitely.
+
+### Improvements
+- Typing indicator now works correctly inside web pages in Chrome and other browsers.
+- Typing indicator no longer flickers or re-appears immediately after a refinement completes.
+- TextRefiner now checks for updates every hour instead of once a day, so you get fixes sooner.
+
+---
+
 ## v1.2.0 — 2026-04-12
 
 ### What's New
