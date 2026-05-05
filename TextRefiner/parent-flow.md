@@ -90,6 +90,25 @@ Give it:
 
 **If LOOP:** send corrections back to the research agent (via SendMessage or new spawn), get a revised plan, re-run QA. Repeat until APPROVED.
 
+### Phase 2.5 — User Review Gate
+After QA approves the plan, STOP. Do not begin implementation.
+
+Report to the user with this structure:
+
+**Plan approved.** Here is what was agreed on:
+
+1. **What is changing** — plain-language summary of every edit, grouped by logical area (no file names or code unless unavoidable)
+2. **Why each change** — one sentence per group explaining what problem it fixes or what it enables
+3. **Files that will be touched** — list from the CHANGES TABLE
+4. **Risks flagged** — any gotchas or caveats noted by QA
+5. **What will NOT change** — files deliberately excluded and why
+
+Then ask:
+
+> Ready to implement? Say yes to proceed, or tell me what to adjust.
+
+Wait for the user's response. If they say yes (or equivalent), continue to Phase 3. If they request changes, send the feedback back to the research agent (Phase 1) and restart the loop.
+
 ### Phase 3 — Implement
 As the Master Parent, implement the approved plan directly using Edit/Write/Read tools. Do not delegate implementation to another agent.
 
@@ -136,7 +155,7 @@ If any entry should be added to `PROBLEMS_AND_SOLUTIONS.md` (a non-obvious probl
 - **Source:** `/Users/noamnahum/Desktop/TextRefiner - Claude/TextRefiner/Sources/`
 - **Structure:** `App/` (main.swift, AppDelegate), `Core/` (HotkeyManager, RefinementCoordinator, LocalInferenceService, AccessibilityService, TypingMonitor, etc.), `UI/` (StreamingPanelController, OnboardingWindowController, SettingsWindowController, ReadyIndicatorController, etc.), `Utilities/` (NotificationManager)
 - **Build:** `cd TextRefiner && ./build.sh` (dev) or `./build.sh release` — includes Metal shader compilation, framework embedding, ad-hoc signing
-- **Deployment target:** macOS 14 Sonoma, M1+ only
+- **Deployment target:** macOS 15 Sequoia, M1+ only
 - **Distribution:** Ad-hoc signed, outside App Store, no sandbox
 - **No tests, no linter** — compile check (`swift build -c release`) is the only automated verification
 - Never create new files unless the task requires it

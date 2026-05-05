@@ -34,6 +34,11 @@ final class RefinementCoordinator {
     /// Referenced by TypingMonitor to hide the ready pill above this limit.
     static let maxInputCharacters = 10_000
 
+    /// Maximum time (in nanoseconds) for inference to complete before auto-cancelling.
+    /// 60 seconds is generous for the 3B model on M1; if it hasn't finished by then,
+    /// something is stuck and the user shouldn't wait indefinitely.
+    static let inferenceTimeoutNanoseconds: UInt64 = 60_000_000_000
+
     /// Fired when the user cancels a refinement in progress (Escape key).
     /// Dismiss spinner/panel, no text replacement.
     var onRefinementCancelled: (() -> Void)?
@@ -90,7 +95,9 @@ final class RefinementCoordinator {
                 // Step 2: Stream from local model on a BACKGROUND thread.
                 // This prevents the model loading / inference from blocking the main
                 // thread and freezing the entire Mac (especially on shared-memory M1).
-                let fullResponse = try await Task.detached { [inferenceService] in
+                // Races inference against a 60s timeout — if inference stalls, the user
+                // sees a "timed out" HUD instead of waiting forever.
+                let inferenceTask = Task.detached { [inferenceService] in
                     var accumulated = ""
                     let stream = inferenceService.streamRewrite(text: selectedText)
 
@@ -106,7 +113,32 @@ final class RefinementCoordinator {
                     // Post-process: strip any prompt artifacts (leaked delimiters,
                     // closing anchor, preamble, wrapping quotes) before pasting.
                     return inferenceService.cleanResponse(accumulated)
-                }.value
+                }
+
+                let fullResponse: String
+                do {
+                    fullResponse = try await withThrowingTaskGroup(of: String.self) { group in
+                        group.addTask {
+                            try await inferenceTask.value
+                        }
+                        group.addTask {
+                            try await Task.sleep(nanoseconds: Self.inferenceTimeoutNanoseconds)
+                            throw RefinementError.inferenceTimedOut
+                        }
+                        // First task to finish wins — if inference completes, we get the
+                        // result; if timeout fires first, it throws inferenceTimedOut.
+                        let result = try await group.next()!
+                        group.cancelAll()
+                        return result
+                    }
+                } catch {
+                    // Explicitly cancel the detached inference task so MLX stops
+                    // generating tokens in the background. Critical: the detached task
+                    // lives outside structured concurrency — group.cancelAll() won't
+                    // reach it.
+                    inferenceTask.cancel()
+                    throw error
+                }
 
                 try Task.checkCancellation()
 
@@ -117,17 +149,26 @@ final class RefinementCoordinator {
                     modelUsed: ModelManager.shared.selectedModelID
                 )
 
-                // Back on main thread — Step 3: Paste immediately
-                AccessibilityService.pasteText(fullResponse)
+                // Back on main thread — Step 3: Paste immediately.
+                // If paste simulation fails, the refined text is still on the clipboard —
+                // show a friendly message telling the user to paste manually.
+                do {
+                    try await AccessibilityService.pasteText(fullResponse)
+                } catch {
+                    throw RefinementError.pasteSimulationFailed
+                }
 
-                // Let the paste event settle before showing confirmation
-                try await Task.sleep(nanoseconds: 200_000_000) // 200ms
+                // Step 4: Brief pause to let the target app process the Cmd+V CGEvent before
+                // showing the checkmark. pasteText() posts the event and returns immediately
+                // (fire-and-forget); the target app renders the text change 10–100ms later.
+                // 60ms covers native AppKit apps (~5–30ms) and most Electron apps (~40–80ms).
+                try await Task.sleep(nanoseconds: 60_000_000)
 
-                // Step 4: Show green checkmark — visual confirmation the paste worked
+                // Show green checkmark + play sound — visual confirmation the paste worked
                 onRefinementComplete?()
 
                 // Hold checkmark for 1 second so the user registers it
-                try await Task.sleep(nanoseconds: 1_000_000_000)
+                try await Task.sleep(nanoseconds: UInt64(DesignTokens.Animation.successHold * 1_000_000_000))
 
                 // Step 5: Dismiss everything
                 onProcessingFinished?()
@@ -137,6 +178,14 @@ final class RefinementCoordinator {
                 // Nothing to do here; just exit silently.
             } catch {
                 onError?(error)
+            }
+
+            // Release the model from memory — no reason to hold 1.8 GB while idle.
+            // Next refinement will reload from cache (~2-5s).
+            Task.detached { [inferenceService] in
+                // Short delay so the model isn't unloaded while the checkmark is still showing
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                inferenceService.unloadModel()
             }
 
             refinementTask = nil
@@ -149,12 +198,16 @@ enum RefinementError: Error, LocalizedError {
     case noTextSelected
     case emptyResponse
     case inputTooLong(Int)
+    case inferenceTimedOut
+    case pasteSimulationFailed
 
     var errorDescription: String? {
         switch self {
         case .noTextSelected:         return "No text selected. Highlight text and try again."
         case .emptyResponse:          return "Model returned an empty response."
         case .inputTooLong(let count): return "Selected text is too long (\(count) characters). Please select 10,000 characters or fewer and try again."
+        case .inferenceTimedOut:      return "Refinement timed out. Try selecting shorter text."
+        case .pasteSimulationFailed:  return "Done! Press CMD + V to paste the new text"
         }
     }
 }

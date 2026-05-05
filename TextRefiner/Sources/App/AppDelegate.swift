@@ -1,3 +1,4 @@
+import AVFoundation
 import Cocoa
 import Sparkle
 
@@ -13,22 +14,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let coordinator = RefinementCoordinator()
     private let hotkeyManager = HotkeyManager()
     private var onboardingController: OnboardingWindowController?
-    private var streamingPanel: StreamingPanelController?
     private var promptSettingsController: PromptSettingsWindowController?
     private var historyController: HistoryWindowController?
     private var settingsController: SettingsWindowController?
     private let updateManager = UpdateManager()
+    /// "Update available →" menu item. Hidden until Sparkle detects a valid update;
+    /// stays visible until the user installs it (app restarts with new version).
+    private var updateAvailableMenuItem: NSMenuItem?
     private let typingMonitor = TypingMonitor()
     private let readyIndicator = ReadyIndicatorController()
-    /// Retains the active NSSound instance for its full playback duration.
-    private var currentSound: NSSound?
+    /// Retains the active AVAudioPlayer instance for its full playback duration.
+    private var audioPlayer: AVAudioPlayer?
+    /// Cursor-based HUD anchor captured at hotkey time for browser contexts.
+    /// Cleared and reset on each new refinement cycle.
+    private var browserAnchorFrame: CGRect?
 
     /// Timer that polls for Accessibility permission after an update resets TCC.
     private var accessibilityPollTimer: Timer?
 
     // MARK: - Lifecycle
 
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if onboardingController != nil {
+            onboardingController?.bringToFront()
+        } else {
+            statusItem.button?.performClick(nil)
+        }
+        return false
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        applyDockVisibility()
         setupMenuBar()
         wireCoordinator()
 
@@ -49,6 +65,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Runs after quarantine removal completes. Contains all permission-dependent
     /// launch logic so nothing attempts a CGEvent tap before the flag is cleared.
     private func completeLaunchSetup() {
+        // Dev fast-path: skip the onboarding wizard entirely.
+        // TCC is reset on every build by build.sh, so just register the app in the
+        // Accessibility list and start polling. The user only needs to toggle it ON
+        // in System Settings — no wizard, no multi-step flow.
+        if Bundle.main.bundleIdentifier == "com.textrefiner.app.dev" {
+            AccessibilityService.requestPermission()
+            if AccessibilityService.isTrusted() {
+                _ = startListening()
+            } else {
+                startAccessibilityPolling()
+            }
+            return
+        }
+
         let hasCompletedOnboarding = UserDefaults.standard.bool(forKey: "com.textrefiner.onboardingCompleted")
 
         // Use a UUID fallback if CFBundleVersion is unreadable (packaging error,
@@ -62,12 +92,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let needsReOnboarding = hasCompletedOnboarding && lastOnboardedBuild != currentBuild
 
         if !hasCompletedOnboarding || needsReOnboarding {
-            // First launch or app was updated — binary hash changed, so the old
-            // TCC entry is stale (points to a different CDHash). Clear it so
-            // "Grant Access" triggers a fresh system prompt for the current binary.
-            if needsReOnboarding {
-                Self.resetAccessibilityPermission()
-            }
+            // Always reset on first launch or after an update. Both cases need a fresh
+            // TCC entry tied to the current binary's CDHash:
+            //
+            // - Re-onboarding: the old entry points to the previous binary (stale CDHash).
+            // - First launch: a stale entry can still exist from a prior install or
+            //   dev-build test session (different bundle ID → different UserDefaults domain,
+            //   but same release bundle ID in TCC). Without a reset, the toggle shows ON
+            //   but authorises the wrong binary — isTrusted() fails and the user loops
+            //   through toggle ON/OFF with no recovery path.
+            //
+            // tccutil reset is a no-op when no entry exists, so this is safe for
+            // genuine first-time installs.
+            Self.resetAccessibilityPermission()
             // Proactively register the app in the Accessibility list by calling
             // AXIsProcessTrustedWithOptions with kAXTrustedCheckOptionPrompt: true.
             // On macOS 14+, CGEvent.tapCreate() alone may not add the app to System
@@ -118,6 +155,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Settings (hotkey configuration, etc.)
         menu.addItem(NSMenuItem(title: "Settings...", action: #selector(showSettings), keyEquivalent: ","))
 
+        // Rebuild & Relaunch — dev builds only
+        if Bundle.main.bundleIdentifier == "com.textrefiner.app.dev" {
+            let rebuildItem = NSMenuItem(title: "Rebuild & Relaunch", action: #selector(rebuildAndRelaunch), keyEquivalent: "")
+            rebuildItem.image = NSImage(systemSymbolName: "hammer.fill", accessibilityDescription: nil)
+            menu.addItem(rebuildItem)
+        }
+
         menu.addItem(NSMenuItem.separator())
 
         // Delete AI Model
@@ -125,31 +169,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
+        // "Update available →" — hidden until Sparkle detects a valid update.
+        // Always present as the permanent fallback after banner dismissals.
+        let updateItem = NSMenuItem(title: "Update available →",
+                                    action: #selector(installAvailableUpdate),
+                                    keyEquivalent: "")
+        updateItem.isHidden = true
+        menu.addItem(updateItem)
+        updateAvailableMenuItem = updateItem
+
         menu.addItem(NSMenuItem(title: "Check for Updates...", action: #selector(checkForUpdates), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "About TextRefiner", action: #selector(showAbout), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quit TextRefiner", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
+
+        // Show the update item the moment Sparkle detects an available update.
+        updateManager.onUpdateDetected = { [weak self] in
+            self?.updateAvailableMenuItem?.isHidden = false
+        }
     }
 
     /// Creates the ✦A menu bar icon programmatically as a template image.
     /// Drawn at 18x18pt (36x36px @2x) — standard menu bar icon size.
     private func createMenuBarIcon() -> NSImage {
-        let size = NSSize(width: 18, height: 18)
+        let iconSize = DesignTokens.Size.MenuBar.iconSize
+        let size = NSSize(width: iconSize, height: iconSize)
         let image = NSImage(size: size, flipped: false) { rect in
             // Draw the sparkle (✦) — small, on the left
-            let sparkleFont = NSFont.systemFont(ofSize: 8, weight: .medium)
             let sparkleAttrs: [NSAttributedString.Key: Any] = [
-                .font: sparkleFont,
+                .font: NSFont.menuBarSparkle,
                 .foregroundColor: NSColor.black
             ]
             let sparkle = NSAttributedString(string: "✦", attributes: sparkleAttrs)
             sparkle.draw(at: NSPoint(x: 0, y: 3))
 
             // Draw the "A" — bold, on the right
-            let aFont = NSFont.systemFont(ofSize: 14, weight: .bold)
             let aAttrs: [NSAttributedString.Key: Any] = [
-                .font: aFont,
+                .font: NSFont.menuBarLetter,
                 .foregroundColor: NSColor.black
             ]
             let aStr = NSAttributedString(string: "A", attributes: aAttrs)
@@ -219,18 +276,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             controller.onHotkeyChanged = { [weak self] in
                 guard let self else { return }
                 // Re-register the CGEvent tap with the new hotkey — no restart required.
+                // start() calls stop() internally, so no explicit stop() needed here.
                 // The return value MUST be checked: silently discarding it was stress test
                 // bug S-01. If permission lapsed while the app was running and the tap
                 // fails here, the user must be notified — not left with a broken hotkey
                 // and a UI that shows the new shortcut as if everything worked.
-                hotkeyManager.stop()
                 if !hotkeyManager.start() {
                     showHotkeyPermissionAlert()
                 }
                 // Update the pill label to show the new hotkey
                 readyIndicator.updateHotkey()
                 let display = HotkeyConfiguration.shared.displayString
+                #if DEBUG
                 print("[TextRefiner] Hotkey changed to \(display)")
+                #endif
             }
             controller.onTypingIndicatorToggled = { [weak self] isEnabled in
                 guard let self else { return }
@@ -242,8 +301,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.readyIndicator.hide()
                 }
             }
+            controller.onDockIconToggled = { isEnabled in
+                NSApp.setActivationPolicy(isEnabled ? .regular : .accessory)
+            }
             controller.onReplayTutorial = { [weak self] in
                 self?.showOnboarding()
+            }
+            controller.onSimulateUpdate = { [weak self] in
+                guard let self else { return }
+                updateManager.simulateUpdateAvailable()
+            }
+            controller.onExcludedAppsChanged = { [weak self] in
+                // Restart the typing monitor so the frontmost-app guard is re-evaluated
+                // immediately. start() calls stop() internally — no explicit stop() needed.
+                self?.typingMonitor.start()
             }
             settingsController = controller
         }
@@ -292,18 +363,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.showPermissionAlert()
         }
 
-        // Hotkey fired, processing begins — hide ready indicator, show spinner + floating panel.
-        // Dismiss any existing panel first (e.g. an error HUD still counting down).
+        // Hotkey fired, processing begins — expand pill with spinner.
+        // Keep typingMonitor.forceHide() to sync its isIndicatorVisible flag.
         // Enable Escape key interception so the user can cancel.
         coordinator.onProcessingStarted = { [weak self] in
-            self?.streamingPanel?.dismiss()
-            self?.streamingPanel = nil
             self?.typingMonitor.forceHide()
-            self?.readyIndicator.hide()
             self?.showSpinner()
-            let panel = StreamingPanelController()
-            panel.show()
-            self?.streamingPanel = panel
+            // In browsers, anchor the HUD to the cursor position captured at hotkey time.
+            // In native apps, use the focused text field frame as usual.
+            //
+            // Read the frontmost app synchronously here rather than relying on
+            // typingMonitor.isBrowserFrontmost, which is updated by a workspace
+            // notification that may not have fired yet when the user switches to a
+            // browser and immediately presses the hotkey. Reading live guarantees
+            // the correct branch is taken regardless of notification timing.
+            let frontmostApp = NSWorkspace.shared.frontmostApplication
+            if TypingMonitor.isBrowserApp(frontmostApp) {
+                let cursor = NSEvent.mouseLocation
+                let pillW = self?.readyIndicator.pillWidth ?? 60
+                self?.browserAnchorFrame = CGRect(
+                    x: cursor.x - pillW / 2,
+                    y: cursor.y,
+                    width: pillW,
+                    height: 1
+                )
+                // Clear any lingering native-app panel before creating the browser HUD.
+                // After a native refinement, finishProcessing() leaves panel != nil at state=.ready.
+                // Without hide(), startProcessing reuses it at the old text field position.
+                self?.readyIndicator.hide()
+            } else {
+                self?.browserAnchorFrame = nil
+            }
+            self?.readyIndicator.startProcessing(
+                near: self?.browserAnchorFrame ?? self?.typingMonitor.lastKnownFrame,
+                trackedElement: self?.typingMonitor.trackedElement
+            )
             self?.hotkeyManager.onEscapePressed = { [weak self] in
                 self?.coordinator.cancelRefinement()
             }
@@ -311,39 +405,123 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Model done, text ready to paste — swap spinner for green checkmark
         coordinator.onRefinementComplete = { [weak self] in
-            self?.streamingPanel?.showCheckmark()
+            self?.readyIndicator.showCheckmark()
             self?.playSound(resource: "Success_Sound", extension: "mp3")
         }
 
-        // Paste complete — dismiss everything, stop intercepting Escape
+        // Paste complete — collapse pill back to ready state, stop intercepting Escape.
+        // Native apps: pill stays visible (TypingMonitor manages it from here).
+        // Browser: pill was cursor-anchored with no TypingMonitor management, so hide it
+        // after the collapse animation completes (browserAnchorFrame != nil = browser context).
+        //
+        // After collapse: decrement snooze counter (if update pending), then check whether
+        // to show the update banner (1.5s delay, pill must still be visible).
         coordinator.onProcessingFinished = { [weak self] in
-            self?.hotkeyManager.onEscapePressed = nil
-            self?.streamingPanel?.dismiss()
-            self?.streamingPanel = nil
-            self?.hideSpinner()
+            guard let self else { return }
+            hotkeyManager.onEscapePressed = nil
+            let isBrowser = browserAnchorFrame != nil
+            readyIndicator.finishProcessing { [weak self] in
+                guard let self else { return }
+
+                // Only successful refinements count toward the snooze countdown.
+                if updateManager.hasPendingUpdate {
+                    updateManager.decrementSnooze()
+                }
+
+                if updateManager.shouldShowBanner {
+                    // Wait 1.5s so the user can absorb the refined text before the banner appears.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                        guard let self else { return }
+                        // Re-check: pill must still be visible after the delay.
+                        // An app switch or hide() call during those 1.5s should cancel the banner.
+                        guard readyIndicator.isPillVisible else {
+                            if isBrowser { readyIndicator.hide() }
+                            return
+                        }
+                        let version = Bundle.main.object(
+                            forInfoDictionaryKey: "CFBundleShortVersionString"
+                        ) as? String ?? ""
+                        readyIndicator.showUpdateBanner(
+                            onUpdate: { [weak self] in
+                                guard let self else { return }
+                                updateManager.recordUpdateNow()
+                                updateAvailableMenuItem?.isHidden = true
+                                updateManager.checkForUpdates()
+                            },
+                            onLater: { [weak self] in
+                                guard let self else { return }
+                                updateManager.recordLater(currentVersion: version)
+                                if isBrowser { readyIndicator.hide() }
+                            }
+                        )
+                    }
+                } else if isBrowser {
+                    readyIndicator.hide()
+                }
+            }
+            hideSpinner()
         }
 
-        // User cancelled with Escape — dismiss spinner/panel, no text pasted
+        // User cancelled with Escape — same browser/native split as onProcessingFinished.
         coordinator.onRefinementCancelled = { [weak self] in
             self?.hotkeyManager.onEscapePressed = nil
-            self?.streamingPanel?.dismiss()
-            self?.streamingPanel = nil
+            if self?.browserAnchorFrame != nil {
+                self?.readyIndicator.finishProcessing { [weak self] in
+                    self?.readyIndicator.hide()
+                }
+            } else {
+                self?.readyIndicator.finishProcessing()
+            }
             self?.hideSpinner()
         }
 
-        // Error — input too long gets the error HUD (auto-dismisses after 5s).
-        // All other errors dismiss the panel immediately and show an NSAlert.
+        // Error — input too long shows error in the pill (auto-dismisses after 5s).
+        // All other errors collapse the pill and show an NSAlert.
         coordinator.onError = { [weak self] error in
             self?.hotkeyManager.onEscapePressed = nil
-            self?.playSound(resource: "Fail_sound", extension: "mp3")
+            self?.playSound(resource: "Fail_sound", extension: "mov")
             if case RefinementError.inputTooLong = error {
                 self?.hideSpinner()
-                self?.streamingPanel?.showInputLimitError {
-                    self?.streamingPanel = nil
+                self?.readyIndicator.showError(near: self?.browserAnchorFrame ?? self?.typingMonitor.lastKnownFrame) {
+                    self?.hotkeyManager.onEscapePressed = nil
+                    self?.readyIndicator.hide()
                 }
+                self?.hotkeyManager.onEscapePressed = { [weak self] in
+                    self?.hotkeyManager.onEscapePressed = nil
+                    self?.readyIndicator.finishProcessing { [weak self] in
+                        self?.readyIndicator.hide()
+                    }
+                }
+            } else if case RefinementError.inferenceTimedOut = error {
+                self?.hideSpinner()
+                self?.readyIndicator.showError(near: self?.browserAnchorFrame ?? self?.typingMonitor.lastKnownFrame, message: "timed out") {
+                    self?.hotkeyManager.onEscapePressed = nil
+                    self?.readyIndicator.hide()
+                }
+                self?.hotkeyManager.onEscapePressed = { [weak self] in
+                    self?.hotkeyManager.onEscapePressed = nil
+                    self?.readyIndicator.finishProcessing { [weak self] in
+                        self?.readyIndicator.hide()
+                    }
+                }
+            } else if case RefinementError.noTextSelected = error {
+                self?.hideSpinner()
+                self?.readyIndicator.showError(near: self?.browserAnchorFrame ?? self?.typingMonitor.lastKnownFrame, message: "no text selected") {
+                    self?.hotkeyManager.onEscapePressed = nil
+                    self?.readyIndicator.hide()
+                }
+                self?.hotkeyManager.onEscapePressed = { [weak self] in
+                    self?.hotkeyManager.onEscapePressed = nil
+                    self?.readyIndicator.finishProcessing { [weak self] in
+                        self?.readyIndicator.hide()
+                    }
+                }
+            } else if case InferenceError.modelNotDownloaded = error {
+                self?.readyIndicator.finishProcessing()
+                self?.hideSpinner()
+                self?.showModelDownloadPrompt()
             } else {
-                self?.streamingPanel?.dismiss()
-                self?.streamingPanel = nil
+                self?.readyIndicator.finishProcessing()
                 self?.hideSpinner()
                 self?.showErrorAlert(error)
             }
@@ -370,14 +548,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         accessibilityPollTimer = nil
 
         hotkeyManager.onHotkeyPressed = { [weak self] in
-            // Hide the ready indicator the moment the hotkey fires
-            self?.typingMonitor.forceHide()
-            self?.readyIndicator.hide()
             self?.coordinator.startRefinement()
         }
 
         let tapCreated = hotkeyManager.start()
+        #if DEBUG
         print("[TextRefiner] Hotkey tap created: \(tapCreated) — listening for \(HotkeyConfiguration.shared.displayString)")
+        #endif
 
         if tapCreated {
             // Start the typing monitor only if the feature is enabled
@@ -392,12 +569,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return tapCreated
     }
 
+    private func applyDockVisibility() {
+        let show = UserDefaults.standard.object(forKey: "com.textrefiner.showDockIcon") == nil
+            || UserDefaults.standard.bool(forKey: "com.textrefiner.showDockIcon")
+        NSApp.setActivationPolicy(show ? .regular : .accessory)
+    }
+
     private func wireTypingMonitor() {
         typingMonitor.onShouldShow = { [weak self] fieldFrame in
             self?.readyIndicator.show(near: fieldFrame)
         }
         typingMonitor.onShouldHide = { [weak self] in
             self?.readyIndicator.hide()
+        }
+        typingMonitor.onAppSwitched = { [weak self] in
+            self?.readyIndicator.clearCachedFrame()
+        }
+        // When the HUD collapses back to the pill after processing/cancel, the pill is
+        // visually present but TypingMonitor.isIndicatorVisible is false (forceHide()
+        // cleared it when the hotkey fired). Without this, the next app-switch emitHide()
+        // is a no-op and the pill stays floating on top of the browser (Issue 3).
+        readyIndicator.onDidReturnToReady = { [weak self] in
+            self?.typingMonitor.restoreIndicatorVisibility()
         }
     }
 
@@ -542,9 +735,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.runModal()
     }
 
+    /// Shown when the AI model is missing — offers to download it immediately.
+    private func showModelDownloadPrompt() {
+        let alert = NSAlert()
+        alert.messageText = "AI Model Not Found"
+        alert.informativeText = "The AI model needs to be downloaded before TextRefiner can refine text. This is a one-time download (~\(ModelManager.modelSize))."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Download Now")
+        alert.addButton(withTitle: "Later")
+        NSApp.activate(ignoringOtherApps: true)
+
+        let response = alert.runModal()
+        guard response == .alertFirstButtonReturn else { return }
+
+        // Show a progress alert while downloading
+        let progressAlert = NSAlert()
+        progressAlert.messageText = "Downloading AI Model…"
+        progressAlert.informativeText = "0%"
+        progressAlert.alertStyle = .informational
+        progressAlert.addButton(withTitle: "Cancel")
+
+        // Add a progress indicator to the alert
+        let progressBar = NSProgressIndicator(frame: NSRect(x: 0, y: 0, width: 250, height: 20))
+        progressBar.isIndeterminate = false
+        progressBar.minValue = 0
+        progressBar.maxValue = 100
+        progressAlert.accessoryView = progressBar
+
+        // Run the download in the background, updating the alert
+        var downloadTask: Task<Void, Error>?
+
+        downloadTask = Task {
+            do {
+                try await coordinator.inferenceService.downloadModel { progress in
+                    DispatchQueue.main.async {
+                        let pct = Int(progress * 100)
+                        progressBar.doubleValue = Double(pct)
+                        progressAlert.informativeText = "\(pct)%"
+                    }
+                }
+                DispatchQueue.main.async {
+                    // Dismiss the progress alert by clicking its button programmatically
+                    NSApp.stopModal(withCode: .alertFirstButtonReturn)
+                    let doneAlert = NSAlert()
+                    doneAlert.messageText = "Download Complete"
+                    doneAlert.informativeText = "The AI model is ready. Select some text and press your hotkey to refine."
+                    doneAlert.alertStyle = .informational
+                    doneAlert.addButton(withTitle: "OK")
+                    doneAlert.runModal()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    NSApp.stopModal(withCode: .alertSecondButtonReturn)
+                    let errorAlert = NSAlert()
+                    errorAlert.messageText = "Download Failed"
+                    errorAlert.informativeText = error.localizedDescription
+                    errorAlert.alertStyle = .warning
+                    errorAlert.addButton(withTitle: "OK")
+                    errorAlert.runModal()
+                }
+            }
+        }
+
+        let modalResponse = progressAlert.runModal()
+        if modalResponse == .alertFirstButtonReturn {
+            // User clicked Cancel on the progress dialog
+            downloadTask?.cancel()
+        }
+    }
+
     // MARK: - Updates
 
     @objc private func checkForUpdates() {
+        updateManager.checkForUpdates()
+    }
+
+    /// Action for the "Update available →" menu item.
+    /// Triggers Sparkle to present its standard download/install flow.
+    @objc private func installAvailableUpdate() {
         updateManager.checkForUpdates()
     }
 
@@ -556,7 +824,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 timer.invalidate()
                 self?.accessibilityPollTimer = nil
                 self?.startListening()
+                #if DEBUG
                 print("[TextRefiner] Accessibility re-granted after update")
+                #endif
             }
         }
     }
@@ -572,11 +842,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
         process.arguments = ["reset", "Accessibility", bundleID]
+        process.environment = ["PATH": "/usr/bin:/bin"]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         try? process.run()
         process.waitUntilExit()
+        #if DEBUG
         print("[TextRefiner] Reset Accessibility TCC for \(bundleID)")
+        #endif
     }
 
     // MARK: - Quarantine Removal
@@ -598,6 +871,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
             process.arguments = ["-dr", "com.apple.quarantine", bundlePath]
+            process.environment = ["PATH": "/usr/bin:/bin"]
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
             try? process.run()
@@ -613,21 +887,88 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         alert.messageText = "TextRefiner"
         let hotkey = HotkeyConfiguration.shared.displayString
-        alert.informativeText = "Highlight text, press \(hotkey), get better writing.\nPowered by local AI.\nModel: \(ModelManager.displayName)\n\nVersion \(version)"
+        alert.informativeText = "Highlight text, press \(hotkey), get better writing.\n100% private — your text never leaves your Mac.\nModel: \(ModelManager.displayName)\n\nVersion \(version)"
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
         alert.runModal()
     }
 
+    // MARK: - Rebuild & Relaunch (dev builds only)
+
+    @objc private func rebuildAndRelaunch() {
+        let bundlePath = Bundle.main.bundlePath
+        let appDir = (bundlePath as NSString).deletingLastPathComponent
+        let buildScript = (appDir as NSString).appendingPathComponent("build.sh")
+
+        Task.detached {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/bash")
+            process.arguments = [buildScript]
+            process.currentDirectoryURL = URL(fileURLWithPath: appDir)
+            process.environment = [
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/usr/libexec",
+                "HOME": ProcessInfo.processInfo.environment["HOME"] ?? "",
+            ]
+
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+
+                let outputData = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: outputData, encoding: .utf8) ?? ""
+
+                await MainActor.run {
+                    if process.terminationStatus == 0 {
+                        let appBundleURL = URL(fileURLWithPath: appDir)
+                            .appendingPathComponent("TextRefiner.app")
+                        // Launch first, then terminate. The previous code used asyncAfter(1s)
+                        // for the open call but called NSApp.terminate() immediately — terminate
+                        // won the race and the new app never launched. open(2) forks immediately
+                        // and returns, so it's safe to terminate right after.
+                        let relaunch = Process()
+                        relaunch.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+                        relaunch.arguments = ["-n", appBundleURL.path]
+                        relaunch.environment = ["PATH": "/usr/bin:/bin"]
+                        try? relaunch.run()
+                        NSApp.terminate(nil)
+                    } else {
+                        let lastLine = output.components(separatedBy: .newlines)
+                            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                            .last ?? "Unknown error"
+                        let alert = NSAlert()
+                        alert.messageText = "Build Failed"
+                        alert.informativeText = lastLine
+                        alert.alertStyle = .critical
+                        alert.runModal()
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    let alert = NSAlert()
+                    alert.messageText = "Build Failed"
+                    alert.informativeText = "Could not run build.sh: \(error.localizedDescription)"
+                    alert.alertStyle = .critical
+                    alert.runModal()
+                }
+            }
+        }
+    }
+
     // MARK: - Audio Feedback
 
-    /// Plays a bundled sound file. Retains the instance in `currentSound` so ARC
-    /// doesn't deallocate it before playback finishes. Stops any in-progress sound first.
+    /// Plays a bundled sound file. Supports mp3, aiff, wav, caf, m4a, and mov.
+    /// Retains the player in `audioPlayer` so ARC doesn't deallocate it mid-playback.
+    /// Respects the user's sound toggle in Settings. Volume is set to 70% of max.
     private func playSound(resource: String, extension ext: String) {
-        guard let url = Bundle.main.url(forResource: resource, withExtension: ext),
-              let sound = NSSound(contentsOf: url, byReference: false) else { return }
-        currentSound?.stop()
-        currentSound = sound
-        sound.play()
+        guard SettingsWindowController.isSoundEnabled else { return }
+        guard let url = Bundle.main.url(forResource: resource, withExtension: ext) else { return }
+        audioPlayer?.stop()
+        audioPlayer = try? AVAudioPlayer(contentsOf: url)
+        audioPlayer?.volume = 0.7
+        audioPlayer?.play()
     }
 }

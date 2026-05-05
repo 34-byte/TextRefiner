@@ -183,7 +183,7 @@ A log of reported and discovered bugs. Each entry documents what the user observ
 
 **What WORKS (current solution):**
 1. `build.sh` finds all `.metal` files in the MLX checkout directory.
-2. Compiles each to `.air` (Apple Intermediate Representation) using `xcrun -sdk macosx metal` with include paths for subdirectories (`steel/`, `steel/gemm/`, `steel/attn/`, `fft/`, etc.) and `-std=metal3.1 -mmacosx-version-min=14.0`.
+2. Compiles each to `.air` (Apple Intermediate Representation) using `xcrun -sdk macosx metal` with include paths for subdirectories (`steel/`, `steel/gemm/`, `steel/attn/`, `fft/`, etc.) and `-std=metal3.1 -mmacosx-version-min=15.0`.
 3. Links all `.air` files into a single `mlx.metallib` using `xcrun -sdk macosx metallib`.
 4. Places the result in `Contents/MacOS/` (colocated with the binary) — MLX searches for `mlx.metallib` next to the executable first.
 5. Codesigns the metallib before signing the app bundle (unsigned code objects break app bundle signing).
@@ -449,3 +449,66 @@ All `TypingMonitor` print statements are wrapped in `#if DEBUG` — they fire in
 **For shipping:** End users hit this after every Sparkle update. The existing re-onboarding flow (version mismatch → TCC reset → onboarding → "Grant Access" button) handles it automatically. The toggle OFF/ON/relaunch sequence is the manual recovery path for dev workflows where the version number isn't bumped between builds.
 
 **Key takeaway:** A TCC toggle that appears ON is not proof that the current binary's CGEvent tap will succeed. The tap is created once at launch — if it failed (because TCC wasn't granted yet at that moment), a relaunch is required. In dev, always bump `CFBundleVersion` or follow the full checklist (build → re-grant → verify hotkey) rather than toggling the switch mid-session.
+
+---
+
+### 23. Shortcut Pill Appears on Web Pages Without Any Text Typed
+
+**What the user sees:** The shortcut pill (showing the hotkey like ⌘⇧R) appears at the top of the screen when clicking on a regular web page — an article, an image, a link — without being in a text field and without having typed anything.
+
+**Steps to reproduce:**
+1. Open Chrome or Safari.
+2. Navigate to any content-heavy web page (a news article, a Wikipedia page, etc.).
+3. Click anywhere on the page that is NOT a text input (e.g. the article body, a heading, an image).
+4. Observe: the pill appears at or near the top of the screen.
+
+**Reported:** 2026-04-13, identified during typing indicator behavior review.
+
+---
+
+### 24. Shortcut Pill Appears in Non-Text Controls
+
+**What the user sees:** The shortcut pill appears when clicking into controls that are not text fields — such as sliders, custom buttons, or certain UI elements in third-party apps — even though there is no text to refine.
+
+**Steps to reproduce:**
+1. Open an app that has non-standard controls (e.g. a media player with a volume slider, or a custom-built Electron app).
+2. Click on a slider, toggle, or non-text interactive element.
+3. Observe: the pill may appear even though no text is present or editable.
+
+**Reported:** 2026-04-13, identified during typing indicator behavior review.
+
+---
+
+### 25. Shortcut Pill Lingers After Refinement Completes
+
+**What the user sees:** After the TextRefiner HUD finishes its animation and collapses back to the small pill, the pill stays visible on screen. It doesn't disappear even though no new text has been typed. The user has to type something — or do nothing and wait — before the pill eventually hides.
+
+**Steps to reproduce:**
+1. Open any text editor or email composer.
+2. Type 40 or more characters.
+3. Select all or part of the text.
+4. Press the TextRefiner hotkey (⌘⇧R by default).
+5. Wait for the refinement to complete and the HUD animation to finish.
+6. Observe: the small pill remains visible on screen even though the refinement is done and nothing new has been written.
+7. The pill only hides once the next poll cycle fires (~500ms), if conditions have changed — or it may stay visible indefinitely if the refined text still has 40+ characters.
+
+**Reported:** 2026-04-13, identified during typing indicator behavior review.
+
+**Design update (2026-04-14):** The intended behavior was revised. The pill is now designed to hide immediately after the refinement animation collapses — for all apps, including native Mac apps and Electron apps. It only reappears when the user makes a new content change (types or deletes). The pill signals "ready to refine new content", not "content exists."
+
+---
+
+### 26. Accessibility Loops on First Launch of Release Build After Dev Testing
+
+**What the user sees:** After building and launching the release version (`com.textrefiner.app`) for the first time — typically after a period of dev build testing — the onboarding window appears with the Accessibility permission row showing orange. The user goes to System Settings, sees TextRefiner listed with the toggle **already ON**, and clicking "Check" in onboarding still shows it as not granted. Toggling OFF and back ON doesn't fix it either.
+
+**Steps to reproduce:**
+1. Run dev builds (`com.textrefiner.app.dev`) for some time.
+2. At some earlier point, run the release build at least once and grant Accessibility — but never complete onboarding (e.g. dismissed it, app crashed, or onboarding state was cleared).
+3. Build a new release (`./build.sh release`) and launch it.
+4. Onboarding shows. Go to System Settings — toggle appears ON.
+5. Click "Check" in onboarding — still orange. Toggling OFF/ON does nothing.
+
+**Root cause:** The release bundle ID (`com.textrefiner.app`) has a TCC entry from step 2 — but it's tied to that earlier binary's CDHash. The new binary has a different CDHash (ad-hoc signing). The toggle shows ON because the *entry* exists, but `isTrusted()` fails because the CDHash doesn't match. The code only called `resetAccessibilityPermission()` on re-onboarding (version mismatch), not on first launch — so the stale entry was never cleared.
+
+**Reported:** 2026-04-14, during v1.3.0 release testing.

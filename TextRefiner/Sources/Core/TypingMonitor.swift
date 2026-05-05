@@ -13,6 +13,31 @@ final class TypingMonitor {
     /// ~7 words x ~5.5 chars/word = 38 chars. Round up to 40.
     private static let characterThreshold = 40
 
+    /// Known browser bundle IDs. When the frontmost app is a browser, the ready pill
+    /// is suppressed — AX cannot distinguish reading from editing inside web content.
+    /// A browser extension is the future path for proper browser support.
+    private static let browserBundleIDs: Set<String> = [
+        "com.google.Chrome",
+        "com.apple.Safari",
+        "org.mozilla.firefox",
+        "company.thebrowser.Browser",   // Arc
+        "com.brave.Browser",
+        "com.microsoft.edgemac",
+        "com.operasoftware.Opera",
+        "com.vivaldi.Vivaldi"
+    ]
+
+    /// Known terminal emulator bundle IDs. The pill is suppressed for terminals —
+    /// text typed here is shell input, not refineable prose.
+    private static let terminalBundleIDs: Set<String> = [
+        "com.apple.Terminal",
+        "com.googlecode.iterm2",        // iTerm2
+        "io.alacritty.Alacritty",       // Alacritty
+        "com.github.wez.wezterm",       // WezTerm
+        "net.kovidgoyal.kitty",         // Kitty
+        "com.hyper.app"                 // Hyper
+    ]
+
     /// UserDefaults key — defaults to true (enabled).
     static let enabledKey = "com.textrefiner.showTypingIndicator"
 
@@ -25,6 +50,10 @@ final class TypingMonitor {
     /// Fired when text drops below threshold, focus moves, or stop() is called.
     var onShouldHide: (() -> Void)?
 
+    /// Fired when the frontmost app changes. Used to clear stale cached
+    /// position data so the HUD doesn't anchor to the previous app's field.
+    var onAppSwitched: (() -> Void)?
+
     // MARK: - State
 
     private var appObserver: AXObserver?
@@ -32,6 +61,43 @@ final class TypingMonitor {
     private var elementObserver: AXObserver?
     private var observedElement: AXUIElement?
     private var isIndicatorVisible = false
+    /// Character count recorded the moment we attached to the current element.
+    /// Used in change-detection mode to avoid showing the pill for pre-existing
+    /// text in Electron apps (see placeholderAttributeAvailable).
+    private var attachCharacterCount: Int?
+    /// True when the focused element exposes kAXPlaceholderValueAttribute.
+    /// Native Mac apps expose it; Electron apps typically do not.
+    /// When false, change-detection mode is active: the pill only shows after
+    /// the user types (count differs from attachCharacterCount).
+    private var placeholderAttributeAvailable = false
+    /// Set to true the first time the character count diverges from attachCharacterCount.
+    /// Once true, the change-detection gate is bypassed for the rest of this element
+    /// session — so deleting back to the baseline count does not re-hide the pill.
+    private var hasDetectedChange = false
+    /// Set to true by restoreIndicatorVisibility() after a refinement completes.
+    /// Applies to all apps (native and Electron): pill stays hidden until the user
+    /// makes a new edit (count diverges from the post-refinement baseline).
+    private var requiresNewEditAfterRefinement = false
+    /// The most recent focused text field frame (Cocoa screen coordinates).
+    /// Updated every time a focused element is checked, regardless of char count.
+    /// Used by AppDelegate to position the pill for processing/error states
+    /// even when the pill was not already visible.
+    private(set) var lastKnownFrame: CGRect?
+    /// The AX element currently being observed for value changes.
+    /// Exposed so callers can perform high-frequency position reads during processing.
+    private(set) var trackedElement: AXUIElement?
+    /// True when the frontmost app is a known browser. Used by AppDelegate to
+    /// anchor the HUD to the mouse cursor instead of a text-field frame.
+    private(set) var isBrowserFrontmost = false
+
+    /// Returns true if the given running application is a known browser.
+    /// Reads bundle ID synchronously at call time — use this instead of
+    /// `isBrowserFrontmost` when you need the live answer (e.g. at hotkey time,
+    /// before the workspace notification has necessarily fired).
+    static func isBrowserApp(_ app: NSRunningApplication?) -> Bool {
+        guard let bundleID = app?.bundleIdentifier else { return false }
+        return browserBundleIDs.contains(bundleID)
+    }
     private var workspaceToken: NSObjectProtocol?
     /// Fallback polling timer — fires every 500ms when an element is observed.
     /// Catches character-count changes in apps (Chrome, Electron) whose renderer
@@ -47,11 +113,16 @@ final class TypingMonitor {
         // token, causing duplicate firings on every app switch.
         stop()
 
+        #if DEBUG
         print("[TypingMonitor] start() called")
+        #endif
         setupWorkspaceObserver()
         attachToFrontmostApp()
+        guard !isBrowserFrontmost else { return }
         attachToFocusedElement()
+        #if DEBUG
         print("[TypingMonitor] start() complete — callbacks set? show=\(onShouldShow != nil) hide=\(onShouldHide != nil)")
+        #endif
     }
 
     func stop() {
@@ -67,6 +138,22 @@ final class TypingMonitor {
     /// Called externally (e.g. when the hotkey fires) to immediately hide.
     func forceHide() {
         emitHide()
+    }
+
+    /// Called when the refinement animation collapses back to pill shape.
+    /// Hides the pill immediately and re-arms the gate so it only reappears after
+    /// the user makes a new edit. Applies to all apps (native and Electron).
+    func restoreIndicatorVisibility() {
+        guard let element = observedElement, !isBrowserFrontmost else { return }
+        // The pill is visually present at this point (animation just finished).
+        // Set the flag so emitHide() fires the callback, then clear it.
+        isIndicatorVisible = true
+        emitHide()
+        // Snapshot the current count as the new baseline. The pill will only
+        // reappear after the user changes the content from this point.
+        attachCharacterCount = readCharacterCount(element)
+        hasDetectedChange = false
+        requiresNewEditAfterRefinement = true
     }
 
     // MARK: - Workspace Observer (app activation)
@@ -86,9 +173,14 @@ final class TypingMonitor {
 
     private func handleAppActivated(_ notification: Notification) {
         let appName = (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.localizedName ?? "?"
+        #if DEBUG
         print("[TypingMonitor] App activated: \(appName)")
+        #endif
         emitHide()
+        onAppSwitched?()
+        teardownElementObserver()
         attachToFrontmostApp()
+        guard !isBrowserFrontmost else { return }
         attachToFocusedElement()
     }
 
@@ -100,7 +192,9 @@ final class TypingMonitor {
         teardownAppObserver()
 
         guard let frontApp = NSWorkspace.shared.frontmostApplication else {
+            #if DEBUG
             print("[TypingMonitor] attachToFrontmostApp: no frontmost app")
+            #endif
             return
         }
         let pid = frontApp.processIdentifier
@@ -108,7 +202,42 @@ final class TypingMonitor {
 
         // Don't observe our own app
         if pid == ProcessInfo.processInfo.processIdentifier {
+            #if DEBUG
             print("[TypingMonitor] attachToFrontmostApp: skipping own app (\(name))")
+            #endif
+            return
+        }
+
+        // Browsers expose only a single AXWebArea to macOS — no per-element focus.
+        // Suppress the pill entirely for browser contexts.
+        // A browser extension is the future path for proper browser support.
+        if let bundleID = frontApp.bundleIdentifier,
+           Self.browserBundleIDs.contains(bundleID) {
+            isBrowserFrontmost = true
+            #if DEBUG
+            print("[TypingMonitor] attachToFrontmostApp: skipping browser (\(name))")
+            #endif
+            return
+        }
+        isBrowserFrontmost = false
+
+        // Terminals expose shell input as text areas — not refineable prose.
+        // Suppress the pill entirely.
+        if let bundleID = frontApp.bundleIdentifier,
+           Self.terminalBundleIDs.contains(bundleID) {
+            #if DEBUG
+            print("[TypingMonitor] attachToFrontmostApp: skipping terminal (\(name))")
+            #endif
+            return
+        }
+
+        // User-excluded apps from Settings — same suppression as terminals.
+        // The hotkey still works; only the pill is hidden.
+        if let bundleID = frontApp.bundleIdentifier,
+           ExcludedAppsStorage.shared.contains(bundleID) {
+            #if DEBUG
+            print("[TypingMonitor] attachToFrontmostApp: skipping user-excluded app (\(name))")
+            #endif
             return
         }
 
@@ -117,7 +246,9 @@ final class TypingMonitor {
         var obs: AXObserver?
         guard AXObserverCreate(pid, Self.axCallback, &obs) == .success,
               let observer = obs else {
+            #if DEBUG
             print("[TypingMonitor] attachToFrontmostApp: AXObserverCreate failed for \(name)")
+            #endif
             return
         }
 
@@ -132,7 +263,9 @@ final class TypingMonitor {
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
         appObserver = observer
         observedAppElement = appElement
+        #if DEBUG
         print("[TypingMonitor] attachToFrontmostApp: watching \(name) (pid \(pid))")
+        #endif
     }
 
     private func teardownAppObserver() {
@@ -152,11 +285,15 @@ final class TypingMonitor {
         var focused: CFTypeRef?
         let axErr = AXUIElementCopyAttributeValue(sysEl, kAXFocusedUIElementAttribute as CFString, &focused)
         guard axErr == .success else {
+            #if DEBUG
             print("[TypingMonitor] attachToFocusedElement: no focused element (AXError \(axErr.rawValue))")
+            #endif
             return
         }
         guard let focused, CFGetTypeID(focused) == AXUIElementGetTypeID() else {
+            #if DEBUG
             print("[TypingMonitor] attachToFocusedElement: focused value is not an AXUIElement")
+            #endif
             return
         }
 
@@ -166,23 +303,31 @@ final class TypingMonitor {
         var roleVal: CFTypeRef?
         let role = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleVal) == .success
             ? (roleVal as? String ?? "?") : "error"
+        #if DEBUG
         print("[TypingMonitor] attachToFocusedElement: role=\(role)")
+        #endif
 
         guard isTextInputElement(element) else {
+            #if DEBUG
             print("[TypingMonitor] attachToFocusedElement: not a text input (role=\(role)), skipping")
+            #endif
             return
         }
 
         var pid: pid_t = 0
         guard AXUIElementGetPid(element, &pid) == .success else {
+            #if DEBUG
             print("[TypingMonitor] attachToFocusedElement: AXUIElementGetPid failed")
+            #endif
             return
         }
 
         var obs: AXObserver?
         guard AXObserverCreate(pid, Self.axCallback, &obs) == .success,
               let observer = obs else {
+            #if DEBUG
             print("[TypingMonitor] attachToFocusedElement: AXObserverCreate failed")
+            #endif
             return
         }
 
@@ -195,7 +340,35 @@ final class TypingMonitor {
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
         elementObserver = observer
         observedElement = element
+        trackedElement = element
+        #if DEBUG
         print("[TypingMonitor] attachToFocusedElement: observing element (pid \(pid))")
+        #endif
+
+        // Record the character count at attach time and whether the element exposes
+        // kAXPlaceholderValueAttribute. These drive the change-detection gate in
+        // checkAndNotify for Electron apps that store placeholder text as the real
+        // AX value without exposing a placeholder attribute.
+        let countAtAttach = readCharacterCount(element)
+        attachCharacterCount = countAtAttach
+        var placeholderProbe: CFTypeRef?
+        placeholderAttributeAvailable = AXUIElementCopyAttributeValue(
+            element, kAXPlaceholderValueAttribute as CFString, &placeholderProbe
+        ) == .success
+        #if DEBUG
+        print("[TypingMonitor] attachToFocusedElement: placeholderAttr=\(placeholderAttributeAvailable) countAtAttach=\(countAtAttach)")
+        #endif
+
+        // Electron apps fire focus notifications late — sometimes after the user has
+        // already typed past the threshold. When that happens, countAtAttach equals
+        // the current count and the change-detection gate (count != baseline) never
+        // opens. Fix: if we're in Electron mode and already above threshold on attach,
+        // open the gate immediately — the content is clearly refineable.
+        // Placeholder text in Electron apps is typically short (< 40 chars), so this
+        // won't falsely trigger on placeholder text.
+        if !placeholderAttributeAvailable && countAtAttach >= Self.characterThreshold {
+            hasDetectedChange = true
+        }
 
         // Check immediately in case we focused into an already-long field
         checkAndNotify(element: element)
@@ -213,6 +386,12 @@ final class TypingMonitor {
         }
         elementObserver = nil
         observedElement = nil
+        trackedElement = nil
+        attachCharacterCount = nil
+        placeholderAttributeAvailable = false
+        hasDetectedChange = false
+        requiresNewEditAfterRefinement = false
+        lastKnownFrame = nil
     }
 
     // MARK: - Polling Fallback
@@ -248,16 +427,62 @@ final class TypingMonitor {
 
     private func checkAndNotify(element: AXUIElement) {
         let count = readCharacterCount(element)
+        #if DEBUG
         print("[TypingMonitor] checkAndNotify: count=\(count) threshold=\(Self.characterThreshold) visible=\(isIndicatorVisible)")
+        #endif
+
+        // Always track the field frame for positioning — even below threshold.
+        // AppDelegate uses lastKnownFrame to position the pill for processing/error
+        // states when the pill was not already visible.
+        let frame = readFieldFrame(element)
+        if let frame { lastKnownFrame = frame }
 
         if count >= Self.characterThreshold {
-            // Only re-emit if we need to move the indicator (field may have scrolled)
-            if let frame = readFieldFrame(element) {
+            // Post-refinement gate — applies to all apps (native and Electron).
+            // After a refinement, the pill is hidden and only reappears once the
+            // user makes a new edit (count diverges from the post-refinement baseline).
+            if requiresNewEditAfterRefinement, let baseline = attachCharacterCount {
+                if count != baseline {
+                    requiresNewEditAfterRefinement = false
+                    hasDetectedChange = true  // also open the Electron gate
+                } else {
+                    #if DEBUG
+                    print("[TypingMonitor] checkAndNotify: post-refinement gate blocked (count==baseline=\(baseline))")
+                    #endif
+                    emitHide()
+                    return
+                }
+            }
+
+            // Change-detection gate for Electron apps: if the element does not expose
+            // kAXPlaceholderValueAttribute, only show the pill after the user has
+            // actually typed (count diverged from the baseline recorded on attach).
+            // This prevents placeholder text stored as the real AX value from
+            // triggering the pill in apps like Slack, Claude Code, and Notion.
+            if !placeholderAttributeAvailable, let baseline = attachCharacterCount {
+                // Once the count has ever diverged from baseline, lock the gate open
+                // permanently for this element session. This prevents deleting back
+                // to the attach count from incorrectly re-hiding the pill.
+                if count != baseline { hasDetectedChange = true }
+                if !hasDetectedChange {
+                    #if DEBUG
+                    print("[TypingMonitor] checkAndNotify: change-detection gate blocked (count==baseline=\(baseline), placeholderAttr=false)")
+                    #endif
+                    emitHide()
+                    return
+                }
+            }
+
+            if let frame {
+                #if DEBUG
                 print("[TypingMonitor] onShouldShow firing (frame=\(frame)) — callback nil? \(onShouldShow == nil)")
+                #endif
                 isIndicatorVisible = true
                 onShouldShow?(frame)
             } else {
+                #if DEBUG
                 print("[TypingMonitor] readFieldFrame returned nil — indicator cannot be positioned")
+                #endif
             }
         } else {
             emitHide()
@@ -290,7 +515,9 @@ final class TypingMonitor {
                 element, kAXPlaceholderValueAttribute as CFString, &placeholderRef
             ) == .success, let placeholder = placeholderRef as? String,
                !placeholder.isEmpty, actual == placeholder {
+                #if DEBUG
                 print("[TypingMonitor] readCharacterCount: value == placeholder, returning 0")
+                #endif
                 return 0
             }
         }
@@ -363,8 +590,7 @@ final class TypingMonitor {
             if role == kAXTextFieldRole as String ||
                role == kAXTextAreaRole as String ||
                role == "AXComboBox" ||
-               role == "AXSearchField" ||
-               role == "AXWebArea" {
+               role == "AXSearchField" {
                 return true
             }
         }

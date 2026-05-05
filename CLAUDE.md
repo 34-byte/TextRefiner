@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 You are a senior macOS developer. The user is not a macOS expert — explain jargon, use plain language, and break complex concepts into clear steps. Code must be production-quality: correct entitlements, no hallucinated APIs, HIG-compliant. When unsure, ask rather than guess.
 
-Minimum deployment target: **macOS 14 Sonoma** (set in Package.swift).
+Minimum deployment target: **macOS 15 Sequoia** (set in Package.swift).
 Target hardware: **M1 and above only** — no Intel legacy support.
 Distribution: **Ad-hoc signed, outside App Store** — no sandbox. Updates via Sparkle.
 
@@ -40,7 +40,11 @@ All code produced in this project must meet these standards:
 
 ## Agent Capabilities
 
-*This section declares what Claude can and cannot do autonomously in this project. It will grow over time as boundaries are established through collaboration. Nothing here yet.*
+**Terminal commands** — Claude can and should run shell commands directly (builds, file inspection, git, etc.). Use the Bash tool rather than describing what the user should run.
+
+**One feature at a time** — When asked to implement more than one feature in a single request, refuse. Remind the user that this is a reliable path to bugs and missed edge cases. Ask them to pick one to start.
+
+**Parent Flow for non-trivial implementations** — Any implementation beyond a single-line fix or minor wording change must use the Parent Flow skill (`/parent-flow`) before finishing. This applies to new features, refactors, and anything with real complexity. Always tell the user when invoking this skill.
 
 ---
 
@@ -128,7 +132,7 @@ HotkeyManager (CGEvent tap)
 
 **Configurable hotkey** — `HotkeyManager` reads keyCode and modifiers from `HotkeyConfiguration.shared` on every event (not cached at tap creation). When the user saves a new hotkey in Settings, `AppDelegate` calls `hotkeyManager.stop()` then `hotkeyManager.start()` to re-register the CGEvent tap. No app restart needed. `ReadyIndicatorController.updateHotkey()` is also called so the pill label reflects the new shortcut immediately.
 
-**Typing indicator** — `TypingMonitor` uses two layers of observation: (1) `NSWorkspace.didActivateApplicationNotification` for app switches, (2) a per-app `AXObserver` (created with the frontmost app's actual PID) watching `kAXFocusedUIElementChangedNotification`, plus (3) a per-element `AXObserver` watching `kAXValueChangedNotification`. Character count is read via `kAXNumberOfCharactersAttribute` with fallback to `kAXValueAttribute` string length. The indicator shows immediately when count >= 40 chars (~7 words) and hides the moment the hotkey fires. Togglable via Settings (`com.textrefiner.showTypingIndicator`, defaults to `true`).
+**Typing indicator** — `TypingMonitor` uses two layers of observation: (1) `NSWorkspace.didActivateApplicationNotification` for app switches, (2) a per-app `AXObserver` (created with the frontmost app's actual PID) watching `kAXFocusedUIElementChangedNotification`, plus (3) a per-element `AXObserver` watching `kAXValueChangedNotification`. Character count is read via `kAXNumberOfCharactersAttribute` with fallback to `kAXValueAttribute` string length. The indicator shows when count >= 40 chars (~7 words) and hides the moment the hotkey fires. **Electron apps** (Slack, Claude Code, Notion) don't expose `kAXPlaceholderValueAttribute` — when this attribute is absent, the pill uses change-detection mode: it only appears after the character count diverges from the baseline recorded at focus time (`attachCharacterCount`). **Post-refinement behavior (all apps):** after a refinement completes, `restoreIndicatorVisibility()` hides the pill and re-arms the gate — the pill only reappears once the user makes a new edit (count diverges from the post-refinement baseline). This is intentional: the pill signals "ready to refine new content", not "content exists." Togglable via Settings (`com.textrefiner.showTypingIndicator`, defaults to `true`).
 
 **Developer rebuild button** — `SettingsWindowController` has a "Rebuild & Relaunch" button that runs `build.sh` via `Process`, then launches the new `TextRefiner.app` and terminates the current instance. This is a dev convenience — `build.sh` still resets TCC, so Accessibility must be re-granted after each rebuild.
 
@@ -146,34 +150,15 @@ Before every release (`./build.sh release`), run through this checklist on the d
 4. **Verify the onboarding tap gate** — simulate a fresh user: `tccutil reset Accessibility com.textrefiner.app.dev`, relaunch, go through onboarding page 1. The "Next" button must not enable until Accessibility is granted AND the CGEvent tap is successfully created. If it lets you click "Next" without a working tap, something is broken.
 5. **Update `CHANGELOG.md`** — add an entry for the new version before building. User-facing language only; no code or technical detail.
 6. **Only then** bump the version and run `./build.sh release`.
+7. **Return to dev build** — run `./build.sh` immediately after. The release build has a different bundle ID (`com.textrefiner.app`) and no "Rebuild & Relaunch" menu item. Staying on it by accident means you're testing the wrong build and will hit the stale-TCC onboarding loop next time you release (see PROBLEMS_AND_SOLUTIONS.md #26).
 
 **Why this matters:** The CGEvent tap is the only mechanism that makes the hotkey work. Every ad-hoc build produces a new CDHash, which invalidates the TCC entry. If the tap silently fails and no one catches it before release, every user who updates will have a broken hotkey.
 
 ---
 
-## Current State (v1.2.0)
+## Project State
 
-**v1.2 shipped:**
-- Settings window with hotkey configuration, launch on login, and developer rebuild button
-- Custom hotkey configuration (key-capture control, live CGEvent tap re-registration)
-- Launch on login toggle (SMAppService)
-- Refinement history panel (last 10 entries, persisted, click-to-copy)
-- Prompt Settings window with history and revert
-- In-app auto-updates via Sparkle (Check for Updates menu item + 24h background checks)
-- Dev/release build modes with separate bundle IDs
-- Typing indicator — floating hotkey pill appears near focused text field when ~7+ words are typed; works in Chrome/Electron via 500ms polling fallback; togglable in Settings
-- **Embedded MLX inference** — on-device Llama 3.2 3B via Apple MLX; no Ollama dependency; model auto-download on first launch; hardware compatibility gate in onboarding
-- **Hotkey guardrails** — onboarding blocks on page 1 until the real CGEvent tap is confirmed created; any tap failure at any launch shows an immediate actionable alert
-- **Comprehensive hotkey hardening (v1.1.7)** — 21 stress-test scenarios fixed; all documented in `HOTKEY_STRESS_TEST.md`
-- **Accessibility registration fix (v1.1.8)** — proactive `AXIsProcessTrustedWithOptions` call ensures the app appears in Accessibility settings after every update
-- **Escape-to-cancel** — Escape key during processing cancels inference and restores the app to idle state; no text is pasted
-- **Input length limit** — 10,000 character cap enforced before inference; over-limit selections show a 5s error HUD (not an alert)
-- **Prompt injection hardening** — clipboard content stripped of delimiter strings before template injection
-- **Audio feedback** — success and failure sounds; failure sound removed from disk, now bundled as `.mov`
-- **Faster cancel + safer paste** — escape cancels mid-inference; failed paste shows clipboard-ready message
-- **Checkmark timing fix** — 60ms post-paste delay so success checkmark/sound land simultaneous with text replacement in the target app
-
-**v1.3 roadmap:** Tone-Adaptive Refinement (system prompt auto-detects text tone, no manual mode selection), polished HUD animations, privacy messaging ("100% local"), performance optimization for M1/8GB baseline. Full specs in `TextRefiner_PRD_V2.txt`.
+See `CHANGELOG.md` for shipped releases. See `ROADMAP.md` for upcoming work.
 
 ---
 

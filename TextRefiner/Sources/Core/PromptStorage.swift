@@ -18,6 +18,8 @@ final class PromptStorage {
     - Do NOT change the author's voice or style.
     - If a sentence is already correct, leave it unchanged.
 
+    Only return the refined text, nothing else.
+
     [TEXT_START]
     {{USER_TEXT}}
     [TEXT_END]
@@ -140,8 +142,12 @@ final class PromptStorage {
         do {
             let encoded = try JSONEncoder.withISO8601.encode(data)
             try encoded.write(to: fileURL, options: .atomic)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
         } catch {
+            #if DEBUG
             print("[TextRefiner] Failed to save prompts.json: \(error.localizedDescription)")
+            #endif
         }
     }
 }

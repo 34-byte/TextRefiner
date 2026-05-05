@@ -63,7 +63,16 @@ enum AccessibilityService {
     static func simulateCopyAndRead() async -> String? {
         let previousCount = NSPasteboard.general.changeCount
 
-        simulateKeyCombo(keyCode: 0x08, flags: .maskCommand) // 0x08 = 'c'
+        // If CGEvent creation fails, treat as "no text selected" — the user sees
+        // a clear error either way. Logging helps diagnose if this ever happens.
+        do {
+            try simulateKeyCombo(keyCode: 0x08, flags: .maskCommand) // 0x08 = 'c'
+        } catch {
+            #if DEBUG
+            print("[TextRefiner] Copy simulation failed: \(error)")
+            #endif
+            return nil
+        }
 
         // Poll pasteboard — target app needs time to process the event
         for _ in 0..<10 {
@@ -80,26 +89,25 @@ enum AccessibilityService {
 
     /// Writes text to the pasteboard and simulates Cmd+V to paste it
     /// into the currently focused app.
-    static func pasteText(_ text: String) {
+    /// Throws if the keystroke simulation fails — the refined text is still
+    /// on the clipboard so the user can paste manually.
+    static func pasteText(_ text: String) async throws {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
-
-        // Small delay to ensure pasteboard is updated before paste fires
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            simulateKeyCombo(keyCode: 0x09, flags: .maskCommand) // 0x09 = 'v'
-        }
+        try simulateKeyCombo(keyCode: 0x09, flags: .maskCommand) // 0x09 = 'v'
     }
 
     // MARK: - Key Simulation
 
     /// Posts a keyboard event with the given virtual key code and modifier flags.
     /// Uses CGEvent to simulate the keypress at the HID level.
-    private static func simulateKeyCombo(keyCode: CGKeyCode, flags: CGEventFlags) {
+    /// Throws `KeySimulationError.eventCreationFailed` if CGEvent creation fails.
+    private static func simulateKeyCombo(keyCode: CGKeyCode, flags: CGEventFlags) throws {
         let source = CGEventSource(stateID: .hidSystemState)
 
         guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true),
               let keyUp = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false) else {
-            return
+            throw KeySimulationError.eventCreationFailed
         }
 
         keyDown.flags = flags
@@ -107,5 +115,16 @@ enum AccessibilityService {
 
         keyDown.post(tap: .cghidEventTap)
         keyUp.post(tap: .cghidEventTap)
+    }
+
+    enum KeySimulationError: Error, LocalizedError {
+        case eventCreationFailed
+
+        var errorDescription: String? {
+            switch self {
+            case .eventCreationFailed:
+                return "Could not simulate keyboard event. Accessibility permission may have been revoked."
+            }
+        }
     }
 }

@@ -34,6 +34,13 @@ final class LocalInferenceService: @unchecked Sendable {
     /// The loaded model container — nil until loadModel() is called.
     private var modelContainer: ModelContainer?
 
+    /// Guards concurrent access to modelContainer and loadingTask.
+    /// Held only during check-and-set (nanoseconds), never during actual loading.
+    private let lock = NSLock()
+
+    /// Deduplicates concurrent loadModel() calls — second caller awaits the same task.
+    private var loadingTask: Task<Void, Error>?
+
     /// Reads the active prompt from PromptStorage at call time.
     private var promptTemplate: String {
         PromptStorage.shared.activePrompt
@@ -87,23 +94,63 @@ final class LocalInferenceService: @unchecked Sendable {
     }
 
     /// Loads the model into memory. Must be called before inference.
+    /// Thread-safe: concurrent callers await the same in-progress load instead of duplicating it.
+    /// Times out after 30s (cache) or 600s (download) to prevent indefinite hangs.
     func loadModel() async throws {
-        guard modelContainer == nil else { return }
+        if modelContainer != nil { return }
 
-        Memory.cacheLimit = 20 * 1024 * 1024
+        // Check-and-set under lock — the lock is held only for nanoseconds to
+        // read/write the loadingTask reference, never during the actual model load.
+        let task: Task<Void, Error> = lock.withLock {
+            if let existing = loadingTask { return existing }
+            let newTask = Task<Void, Error> {
+                // 30s when model is cached on disk, 10 min for first download (1.8 GB)
+                let timeoutSeconds: UInt64 = self.isModelDownloaded() ? 30 : 600
 
-        let hub = HubApi(downloadBase: Self.modelCacheURL)
-        let container = try await LLMModelFactory.shared.loadContainer(
-            hub: hub,
-            configuration: Self.modelConfiguration
-        ) { _ in }
+                Memory.cacheLimit = 20 * 1024 * 1024
+                let hub = HubApi(downloadBase: Self.modelCacheURL)
 
-        self.modelContainer = container
+                let container = try await withThrowingTaskGroup(of: ModelContainer.self) { group in
+                    group.addTask {
+                        try await LLMModelFactory.shared.loadContainer(
+                            hub: hub,
+                            configuration: Self.modelConfiguration
+                        ) { _ in }
+                    }
+                    group.addTask {
+                        try await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
+                        throw InferenceError.modelLoadTimedOut
+                    }
+                    // First task to complete wins — cancel the other
+                    let result = try await group.next()!
+                    group.cancelAll()
+                    return result
+                }
+
+                self.modelContainer = container
+                self.lock.withLock { self.loadingTask = nil }
+            }
+            loadingTask = newTask
+            return newTask
+        }
+        try await task.value
+    }
+
+    /// Releases the model from memory without deleting files from disk.
+    /// Called after refinement completes — no reason to hold 1.8 GB while idle.
+    func unloadModel() {
+        lock.withLock {
+            modelContainer = nil
+        }
     }
 
     /// Removes the model files from disk and unloads from memory.
     func deleteModel() throws {
-        modelContainer = nil
+        lock.withLock {
+            modelContainer = nil
+            loadingTask?.cancel()
+            loadingTask = nil
+        }
         let fm = FileManager.default
         if fm.fileExists(atPath: Self.modelCacheURL.path) {
             try fm.removeItem(at: Self.modelCacheURL)
@@ -117,7 +164,7 @@ final class LocalInferenceService: @unchecked Sendable {
     /// Returns an AsyncThrowingStream that yields individual text chunks as they arrive.
     func streamRewrite(text: String) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
-            Task {
+            let producerTask = Task {
                 do {
                     // Ensure model is loaded
                     if self.modelContainer == nil {
@@ -155,6 +202,9 @@ final class LocalInferenceService: @unchecked Sendable {
                     let stream = try await container.generate(input: lmInput, parameters: parameters)
 
                     for await generation in stream {
+                        // Check cancellation each token — stops inference promptly when
+                        // the user presses Escape instead of running to 2048 tokens.
+                        try Task.checkCancellation()
                         if let chunk = generation.chunk, !chunk.isEmpty {
                             continuation.yield(chunk)
                         }
@@ -164,6 +214,12 @@ final class LocalInferenceService: @unchecked Sendable {
                 } catch {
                     continuation.finish(throwing: error)
                 }
+            }
+
+            // When the consumer (RefinementCoordinator) cancels, propagate into the
+            // producer task so MLX inference actually stops — not just ignored.
+            continuation.onTermination = { @Sendable _ in
+                producerTask.cancel()
             }
         }
     }
@@ -221,6 +277,7 @@ enum InferenceError: Error, LocalizedError {
     case modelLoadFailed(String)
     case generationFailed(String)
     case integrityCheckFailed
+    case modelLoadTimedOut
 
     var errorDescription: String? {
         switch self {
@@ -228,6 +285,7 @@ enum InferenceError: Error, LocalizedError {
         case .modelLoadFailed(let msg): return "Failed to load AI model: \(msg)"
         case .generationFailed(let msg): return "Text generation failed: \(msg)"
         case .integrityCheckFailed: return "AI model integrity check failed. The model files have been removed and will be re-downloaded on next launch."
+        case .modelLoadTimedOut: return "Model loading timed out. Check your internet connection and try again."
         }
     }
 }

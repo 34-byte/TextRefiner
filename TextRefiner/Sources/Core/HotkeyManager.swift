@@ -43,7 +43,9 @@ final class HotkeyManager {
             callback: hotkeyCallback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
+            #if DEBUG
             print("[TextRefiner] Failed to create event tap — Accessibility permission missing?")
+            #endif
             return false
         }
 
@@ -58,6 +60,7 @@ final class HotkeyManager {
     }
 
     /// Removes the event tap and cleans up.
+    /// Safe to call multiple times — subsequent calls are no-ops.
     func stop() {
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
@@ -65,13 +68,15 @@ final class HotkeyManager {
             // A keypress already in-flight when stop() is called could otherwise still
             // arrive at the callback after eventTap is set to nil.
             CFMachPortInvalidate(tap)
+            // Nil immediately after invalidation — prevents any second call to stop()
+            // from double-invalidating the same port (undefined behavior).
+            eventTap = nil
         }
         if let source = runLoopSource {
             // Match the run loop used in start() — must be the main run loop.
             CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+            runLoopSource = nil
         }
-        eventTap = nil
-        runLoopSource = nil
     }
 
     /// Re-enables the tap if macOS disabled it (timeout/user input protection).

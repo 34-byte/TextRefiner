@@ -2,7 +2,7 @@ import Cocoa
 import SwiftUI
 
 /// Manages the one-time onboarding window shown on first launch.
-/// Two pages: (1) Setup — Hardware check + Accessibility + Model download, (2) Tutorial — how-it-works + before/after.
+/// Three pages: (1) Welcome — intro + feature overview, (2) Setup — Hardware check + Accessibility + Model download, (3) Tutorial — how-it-works + before/after.
 final class OnboardingWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
 
@@ -17,7 +17,7 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
     /// Called when onboarding completes successfully — both checks passed.
     var onComplete: (() -> Void)?
 
-    /// Called when the user clicks "Next" on setup page 1.
+    /// Called when the user clicks "Next" on the setup page (page 2).
     /// Tries to register the real CGEvent tap and returns true if it succeeded.
     /// The page transition to the tutorial is blocked until this returns true —
     /// so the user can never reach the tutorial without a working hotkey.
@@ -41,7 +41,11 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
         let capturedOnReadyForTrial: (() -> Bool)? = self.onReadyForTrial
 
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 620),
+            contentRect: NSRect(
+                x: 0, y: 0,
+                width: DesignTokens.Size.Window.onboarding.width,
+                height: DesignTokens.Size.Window.onboarding.height
+            ),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -101,7 +105,7 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
             // Record onboarding as complete so the next launch doesn't restart setup.
             onComplete?()
         } else {
-            // User closed on the setup page — the hotkey was never registered.
+            // User closed on the welcome or setup page — the hotkey was never registered.
             // Tell AppDelegate to start polling so the app self-heals if the user
             // grants Accessibility permission later through System Settings.
             onDismissedEarly?()
@@ -114,9 +118,10 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
 struct OnboardingContainerView: View {
     let onComplete: () -> Void
     let onReadyForTrial: () -> Bool
-    @State private var currentPage: OnboardingPage = .setup
+    @State private var currentPage: OnboardingPage = .welcome
 
     enum OnboardingPage {
+        case welcome
         case setup
         case tutorial
     }
@@ -124,13 +129,19 @@ struct OnboardingContainerView: View {
     var body: some View {
         Group {
             switch currentPage {
+            case .welcome:
+                OnboardingWelcomeView(onNext: {
+                    withAnimation(.easeInOut(duration: DesignTokens.Animation.pageTransition)) {
+                        currentPage = .setup
+                    }
+                })
             case .setup:
                 // onNext returns true only if the real CGEvent tap was created.
-                // If false the view stays on page 1 and shows a tap-failed error.
+                // If false the view stays on page 2 and shows a tap-failed error.
                 OnboardingSetupView(onNext: {
                     let tapOK = onReadyForTrial()
                     if tapOK {
-                        withAnimation(.easeInOut(duration: 0.3)) {
+                        withAnimation(.easeInOut(duration: DesignTokens.Animation.pageTransition)) {
                             currentPage = .tutorial
                         }
                     }
@@ -140,11 +151,158 @@ struct OnboardingContainerView: View {
                 OnboardingTutorialView(onComplete: onComplete)
             }
         }
-        .frame(width: 520, height: 620)
+        .frame(width: DesignTokens.Size.Window.onboarding.width, height: DesignTokens.Size.Window.onboarding.height)
     }
 }
 
-// MARK: - Page 1: Setup (Hardware check + Accessibility + Model download)
+// MARK: - Page 1: Welcome (intro + feature overview)
+
+struct OnboardingWelcomeView: View {
+    let onNext: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 20) {
+                // App title — centered
+                HStack(spacing: 10) {
+                    Text("✦")
+                        .font(.system(size: 28))
+                    Text("TextRefiner")
+                        .font(.largeTitle.bold())
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+
+                // Tagline card — green background
+                Text("Write fast. Refine it. Get polished text in seconds.\n— Nothing ever leaves your Mac.")
+                    .font(.system(size: 15, weight: .semibold))
+                    .multilineTextAlignment(.center)
+                    .lineSpacing(4)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 28)
+                    .background(
+                        RoundedRectangle(cornerRadius: DesignTokens.Radius.card)
+                            .fill(Color.green.opacity(0.12))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: DesignTokens.Radius.card)
+                            .stroke(Color.green.opacity(0.25), lineWidth: 0.5)
+                    )
+
+                Divider()
+
+                Text("What it does")
+                    .font(Font(NSFont.captionEyebrow))
+                    .textCase(.uppercase)
+                    .tracking(0.8)
+                    .foregroundColor(Color(nsColor: .secondaryLabelColor))
+
+                VStack(spacing: 12) {
+                    WelcomeFeatureRow(
+                        icon: "keyboard",
+                        title: "Stop rewriting the same sentence",
+                        description: "Highlight anything, press the shortcut, and it comes back clean — right where you're typing."
+                    )
+                    WelcomeFeatureRow(
+                        icon: "sparkles",
+                        title: "Sound like yourself, but sharper",
+                        description: "Your ideas stay yours. The rough edges get smoothed out — without sounding like a robot wrote it."
+                    )
+                    WelcomeFeatureRow(
+                        icon: "lock.fill",
+                        title: "Write freely — nothing leaves your Mac",
+                        description: "No account, no cloud, nothing shared. Your words are processed entirely on your device."
+                    )
+                }
+
+                Divider()
+
+                Text("Good to know")
+                    .font(Font(NSFont.captionEyebrow))
+                    .textCase(.uppercase)
+                    .tracking(0.8)
+                    .foregroundColor(Color(nsColor: .secondaryLabelColor))
+
+                HStack(spacing: 8) {
+                    Text("English only")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(Color.orange.opacity(0.9))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(Color.orange.opacity(0.12))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 4)
+                                .stroke(Color.orange.opacity(0.25), lineWidth: 0.5)
+                        )
+                    Text("Works best in English — other languages may not refine correctly.")
+                        .font(Font(NSFont.labelRegular))
+                        .foregroundColor(Color(nsColor: .secondaryLabelColor))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(DesignTokens.Spacing.Onboarding.padding)
+
+            Spacer(minLength: 8)
+
+            VStack(spacing: 0) {
+                Divider()
+                HStack {
+                    OnboardingPageDots(activePage: 1)
+                    Spacer()
+                    Button("Continue") {
+                        onNext()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                }
+                .padding(.horizontal, 28)
+                .padding(.vertical, 14)
+            }
+        }
+    }
+}
+
+// MARK: - Welcome Feature Row
+
+private struct WelcomeFeatureRow: View {
+    let icon: String
+    let title: String
+    let description: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 9)
+                    .fill(Color.accentColor.opacity(0.15))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 9)
+                            .stroke(Color.accentColor.opacity(0.3), lineWidth: 0.5)
+                    )
+                Image(systemName: icon)
+                    .font(.system(size: 16))
+                    .foregroundColor(.accentColor)
+                    .frame(width: 20, height: 20)
+            }
+            .frame(width: 34, height: 34)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(Font(NSFont.headlineSection))
+                Text(description)
+                    .font(Font(NSFont.labelRegular))
+                    .foregroundColor(Color(nsColor: .secondaryLabelColor))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.top, 2)
+        }
+    }
+}
+
+// MARK: - Page 2: Setup (Hardware check + Accessibility + Model download)
 
 struct OnboardingSetupView: View {
     /// Returns true if the hotkey tap was successfully created; false if it failed.
@@ -191,6 +349,26 @@ struct OnboardingSetupView: View {
             Text("Refinement takes 2–5 seconds. You'll see a spinner while it works.")
                 .font(.callout)
                 .foregroundColor(.secondary)
+
+            // Privacy badge — visual callout reinforcing the on-device promise
+            HStack(spacing: 8) {
+                Image(systemName: "lock.shield.fill")
+                    .font(.system(size: 14))
+                    .foregroundColor(.green)
+                Text("100% private — your text is processed on-device and never leaves your Mac.")
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(DesignTokens.Spacing.lg)
+            .background(
+                RoundedRectangle(cornerRadius: DesignTokens.Radius.inset)
+                    .fill(Color.green.opacity(0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: DesignTokens.Radius.inset)
+                    .stroke(Color.green.opacity(0.15), lineWidth: 0.5)
+            )
 
             Divider()
 
@@ -379,13 +557,14 @@ struct OnboardingSetupView: View {
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                     }
-                    .padding(10)
+                    .padding(DesignTokens.Spacing.lg)
                     .background(Color.red.opacity(0.08))
-                    .cornerRadius(8)
+                    .cornerRadius(DesignTokens.Radius.inset)
                 }
 
                 // MARK: Next Button
                 HStack {
+                    OnboardingPageDots(activePage: 2)
                     Spacer()
                     Button("Next") {
                         // Guard against double-click: a second press while the first
@@ -411,7 +590,7 @@ struct OnboardingSetupView: View {
                 }
             }
         }
-        .padding(30)
+        .padding(DesignTokens.Spacing.Onboarding.padding)
         .task {
             guard hardwareOK else { return }
             // Check if model is already downloaded
@@ -454,7 +633,7 @@ struct OnboardingSetupView: View {
     }
 }
 
-// MARK: - Page 2: Tutorial (How It Works + interactive trial)
+// MARK: - Page 3: Tutorial (How It Works + interactive trial)
 
 struct OnboardingTutorialView: View {
     let onComplete: () -> Void
@@ -466,7 +645,7 @@ struct OnboardingTutorialView: View {
                 // Hero hotkey section
                 VStack(spacing: 6) {
                     Text("Your Shortcut")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(Font(NSFont.captionEyebrow))
                         .textCase(.uppercase)
                         .tracking(1.2)
                         .foregroundColor(Color(nsColor: .secondaryLabelColor))
@@ -477,37 +656,39 @@ struct OnboardingTutorialView: View {
                         .padding(.horizontal, 24)
                         .padding(.vertical, 10)
                         .background(
-                            RoundedRectangle(cornerRadius: 10)
+                            RoundedRectangle(cornerRadius: DesignTokens.Radius.hotkeyDisplay)
                                 .fill(Color.accentColor.opacity(0.08))
                         )
                         .overlay(
-                            RoundedRectangle(cornerRadius: 10)
+                            RoundedRectangle(cornerRadius: DesignTokens.Radius.hotkeyDisplay)
                                 .stroke(Color.accentColor.opacity(0.25), lineWidth: 1.5)
                         )
 
                     Text("You can change this anytime in Settings")
-                        .font(.system(size: 11))
+                        .font(Font(NSFont.captionRegular))
                         .foregroundColor(Color(nsColor: .tertiaryLabelColor))
                 }
 
                 // Combined How It Works + Trial — single card
                 HowItWorksFlow(hotkey: hotkey)
             }
-            .padding(.horizontal, 28)
-            .padding(.top, 24)
+            .padding(.horizontal, DesignTokens.Spacing.Onboarding.horizontal)
+            .padding(.top, DesignTokens.Spacing.Onboarding.top)
 
             Spacer(minLength: 8)
 
             // Pinned Get Started button
             VStack(spacing: 0) {
                 Divider()
-                Button(action: { onComplete() }) {
-                    Text("Get Started")
-                        .font(.system(size: 14, weight: .semibold))
-                        .frame(maxWidth: .infinity)
+                HStack {
+                    OnboardingPageDots(activePage: 3)
+                    Spacer()
+                    Button("Get Started") {
+                        onComplete()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
                 .padding(.horizontal, 28)
                 .padding(.vertical, 14)
             }
@@ -528,7 +709,7 @@ private struct HowItWorksFlow: View {
         VStack(alignment: .leading, spacing: 0) {
             // Section header
             Text("How It Works")
-                .font(.system(size: 13, weight: .bold))
+                .font(Font(NSFont.headlineCard))
                 .textCase(.uppercase)
                 .tracking(0.8)
                 .foregroundColor(Color(nsColor: .secondaryLabelColor))
@@ -547,12 +728,12 @@ private struct HowItWorksFlow: View {
 
             // Trial header
             Text("Give it a try")
-                .font(.system(size: 13, weight: .semibold))
+                .font(Font(NSFont.headlineSection))
                 .padding(.bottom, 8)
 
             // Hint text
             Text("Select the text below and press **\(hotkey)**, or click Refine.")
-                .font(.system(size: 11))
+                .font(Font(NSFont.captionRegular))
                 .foregroundColor(Color(nsColor: .secondaryLabelColor))
                 .padding(.bottom, 4)
 
@@ -585,14 +766,14 @@ private struct HowItWorksFlow: View {
             .disabled(isRefining || trialText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             .padding(.top, 10)
         }
-        .padding(16)
+        .padding(DesignTokens.Spacing.Onboarding.cardPadding)
         .background(
-            RoundedRectangle(cornerRadius: 14)
-                .fill(Color(nsColor: .controlBackgroundColor))
+            RoundedRectangle(cornerRadius: DesignTokens.Radius.card)
+                .fill(Color(nsColor: .surfaceControl))
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 14)
-                .stroke(Color(nsColor: .separatorColor).opacity(0.5), lineWidth: 0.5)
+            RoundedRectangle(cornerRadius: DesignTokens.Radius.card)
+                .stroke(Color(nsColor: .borderSeparatorMuted), lineWidth: 0.5)
         )
     }
 
@@ -620,79 +801,22 @@ private struct HowItWorksFlow: View {
                     hasRefined = true
                 }
             } catch {
-                // Model was verified working on page 1 — silent recovery
+                // Model was verified working on page 2 — silent recovery
             }
             isRefining = false
         }
     }
 }
 
-// MARK: - Custom NSTextView Subclass
-
-/// NSTextView subclass that explicitly handles Cmd+C/V/A/X key equivalents.
-/// Inside an NSHostingController, the SwiftUI hosting view can intercept key events
-/// before they reach embedded AppKit views. This subclass overrides `performKeyEquivalent`
-/// to ensure standard editing shortcuts (and CGEvent-posted Cmd+C from the hotkey flow)
-/// always reach the text view.
-private final class TrialTextView: NSTextView {
-
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        guard event.modifierFlags.contains(.command) else {
-            return super.performKeyEquivalent(with: event)
-        }
-
-        switch event.charactersIgnoringModifiers {
-        case "c":
-            // Cmd+C — copy. This is the critical path for CGEvent-posted copy
-            // from AccessibilityService.simulateCopyAndRead().
-            if selectedRange().length > 0 {
-                copy(nil)
-                return true
-            }
-            return false
-        case "v":
-            paste(nil)
-            return true
-        case "a":
-            selectAll(nil)
-            return true
-        case "x":
-            if selectedRange().length > 0 {
-                cut(nil)
-                return true
-            }
-            return false
-        case "z":
-            if event.modifierFlags.contains(.shift) {
-                undoManager?.redo()
-            } else {
-                undoManager?.undo()
-            }
-            return true
-        default:
-            return super.performKeyEquivalent(with: event)
-        }
-    }
-
-    /// Accept first responder so this text view can receive key events
-    /// and participate in the responder chain for CGEvent-posted keys.
-    override var acceptsFirstResponder: Bool { true }
-
-    override func becomeFirstResponder() -> Bool {
-        let result = super.becomeFirstResponder()
-        return result
-    }
-}
-
 // MARK: - Native NSTextView Wrapper
 
-/// Wraps a real NSTextView (TrialTextView subclass) inside NSScrollView so the
+/// Wraps a real NSTextView (KeyEquivalentTextView subclass) inside NSScrollView so the
 /// "Give it a try" text area behaves like a fully native macOS text field:
 /// Cmd-A (select all), mouse selection, Cmd-C/V, and — critically — responds
 /// to CGEvent-posted Cmd+C from the hotkey flow.
 ///
 /// SwiftUI's TextEditor, when hosted in NSHostingController, intercepts key events
-/// and breaks standard editing shortcuts. The TrialTextView subclass overrides
+/// and breaks standard editing shortcuts. KeyEquivalentTextView overrides
 /// performKeyEquivalent to reclaim those events.
 private struct NativeTextView: NSViewRepresentable {
     @Binding var text: String
@@ -709,7 +833,7 @@ private struct NativeTextView: NSViewRepresentable {
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = false
 
-        let textView = TrialTextView()
+        let textView = KeyEquivalentTextView()
         textView.delegate = context.coordinator
         textView.isEditable = true
         textView.isSelectable = true
@@ -720,9 +844,9 @@ private struct NativeTextView: NSViewRepresentable {
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
 
-        textView.font = NSFont.systemFont(ofSize: 12.5)
-        textView.textColor = NSColor.labelColor
-        textView.backgroundColor = NSColor.textBackgroundColor
+        textView.font = .labelRegular
+        textView.textColor = .textPrimary
+        textView.backgroundColor = .surfaceCode
         textView.drawsBackground = true
         textView.textContainerInset = NSSize(width: 8, height: 8)
 
@@ -740,10 +864,10 @@ private struct NativeTextView: NSViewRepresentable {
 
         // Style the scroll view with rounded corners and border
         scrollView.wantsLayer = true
-        scrollView.layer?.cornerRadius = 8
+        scrollView.layer?.cornerRadius = DesignTokens.Radius.inset
         scrollView.layer?.masksToBounds = true
         scrollView.layer?.borderWidth = 0.5
-        scrollView.layer?.borderColor = NSColor.separatorColor.cgColor
+        scrollView.layer?.borderColor = NSColor.borderSeparator.cgColor
 
         scrollView.documentView = textView
         context.coordinator.textView = textView
@@ -760,7 +884,7 @@ private struct NativeTextView: NSViewRepresentable {
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        guard let textView = scrollView.documentView as? TrialTextView else { return }
+        guard let textView = scrollView.documentView as? KeyEquivalentTextView else { return }
 
         // Only update text if it changed from outside (e.g., after refinement)
         if textView.string != text {
@@ -780,16 +904,16 @@ private struct NativeTextView: NSViewRepresentable {
         // Update border color based on refinement state
         if hasRefined {
             scrollView.layer?.borderWidth = 1.5
-            scrollView.layer?.borderColor = NSColor.systemGreen.withAlphaComponent(0.4).cgColor
+            scrollView.layer?.borderColor = NSColor.borderSuccess.cgColor
         } else {
             scrollView.layer?.borderWidth = 0.5
-            scrollView.layer?.borderColor = NSColor.separatorColor.cgColor
+            scrollView.layer?.borderColor = NSColor.borderSeparator.cgColor
         }
     }
 
     class Coordinator: NSObject, NSTextViewDelegate {
         var parent: NativeTextView
-        weak var textView: TrialTextView?
+        weak var textView: KeyEquivalentTextView?
 
         /// Guard flag to prevent binding feedback loops during programmatic text updates.
         var isUpdatingFromSwiftUI = false
@@ -814,23 +938,23 @@ private struct StepRow: View {
     let icon: String
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: DesignTokens.Spacing.lg) {
             ZStack {
                 Circle()
                     .fill(Color.accentColor)
-                    .frame(width: 24, height: 24)
+                    .frame(width: DesignTokens.Size.Onboarding.stepCircle, height: DesignTokens.Size.Onboarding.stepCircle)
                 Text("\(number)")
                     .font(.system(size: 12, weight: .bold, design: .rounded))
                     .foregroundColor(.white)
             }
 
             Image(systemName: icon)
-                .font(.system(size: 12, weight: .semibold))
+                .font(Font(NSFont.labelSemibold))
                 .foregroundColor(.accentColor)
-                .frame(width: 14)
+                .frame(width: DesignTokens.Size.Onboarding.stepIconWidth)
 
             Text(label)
-                .font(.system(size: 13, weight: .semibold))
+                .font(Font(NSFont.headlineSection))
         }
     }
 }
@@ -841,7 +965,7 @@ private struct StepConnector: View {
     var body: some View {
         HStack {
             DashedLine()
-                .stroke(Color.accentColor.opacity(0.3), style: StrokeStyle(lineWidth: 1.5, dash: [3, 3]))
+                .stroke(Color(nsColor: .interactiveAccentStepConnector), style: StrokeStyle(lineWidth: 1.5, dash: [3, 3]))
                 .frame(width: 1.5, height: 16)
                 .padding(.leading, 11)
             Spacer()
@@ -856,5 +980,27 @@ private struct DashedLine: Shape {
         path.move(to: CGPoint(x: rect.midX, y: rect.minY))
         path.addLine(to: CGPoint(x: rect.midX, y: rect.maxY))
         return path
+    }
+}
+
+// MARK: - Page Dots
+
+private struct OnboardingPageDots: View {
+    let activePage: Int
+
+    var body: some View {
+        HStack(spacing: 5) {
+            ForEach(1...3, id: \.self) { page in
+                if page == activePage {
+                    Capsule()
+                        .fill(Color.accentColor)
+                        .frame(width: 16, height: 5)
+                } else {
+                    Circle()
+                        .fill(Color(nsColor: .tertiaryLabelColor))
+                        .frame(width: 5, height: 5)
+                }
+            }
+        }
     }
 }

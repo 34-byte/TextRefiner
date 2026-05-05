@@ -3,14 +3,18 @@
 # build.sh — Compiles TextRefiner and packages it into a macOS .app bundle.
 #
 # Usage:
-#   ./build.sh          Build for development (ad-hoc sign, TCC reset, dev bundle ID)
-#   ./build.sh dev      Same as above
-#   ./build.sh release  Build for distribution (ad-hoc sign, no TCC reset, prod bundle ID,
-#                        creates .zip + Sparkle EdDSA signature for appcast)
+#   ./build.sh             Build for development (ad-hoc sign, TCC reset, dev bundle ID)
+#   ./build.sh dev         Same as above
+#   ./build.sh diagnostic  Same as dev, but compiles with -DDEBUG so every `#if DEBUG`
+#                          print statement is included. Use when reproducing bugs that
+#                          need Terminal log output (e.g. TypingMonitor AX diagnostics).
+#   ./build.sh release     Build for distribution (ad-hoc sign, no TCC reset, prod bundle ID,
+#                          creates .zip + Sparkle EdDSA signature for appcast)
 #
 # Dev mode:
 #   - Uses Info-Dev.plist (bundle ID: com.textrefiner.app.dev, no Sparkle appcast)
 #   - Ad-hoc signed, TCC reset after build (new binary hash each time)
+#   - App skips onboarding in DEBUG builds — just re-grant Accessibility when prompted
 #   - For local development only
 #
 # Release mode:
@@ -30,9 +34,25 @@ CONTENTS="$APP_BUNDLE/Contents"
 MACOS_DIR="$CONTENTS/MacOS"
 RESOURCES_DIR="$CONTENTS/Resources"
 
+SIGN_ID="-"
+
 echo "==> Building $APP_NAME (mode: $MODE)..."
 cd "$SCRIPT_DIR"
-swift build -c release 2>&1
+
+# Use Xcode's Swift toolchain if available (required for mlx-swift-lm >= 2.31.3
+# which needs Swift Tools 6.1+; Command Line Tools ships an older toolchain).
+if [ -d "/Applications/Xcode.app/Contents/Developer" ]; then
+    export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
+fi
+
+if [ "$MODE" = "diagnostic" ]; then
+    # Inject DEBUG flag into release-configured build so `#if DEBUG` print
+    # statements compile in. Still builds in release configuration so the
+    # rest of the bundling pipeline (paths under .build/release) works unchanged.
+    swift build -c release -Xswiftc -D -Xswiftc DEBUG 2>&1
+else
+    swift build -c release 2>&1
+fi
 
 # Find the built binary
 BINARY="$BUILD_DIR/release/$APP_NAME"
@@ -63,7 +83,7 @@ install_name_tool -add_rpath @executable_path/../Frameworks "$MACOS_DIR/$APP_NAM
 if [ "$MODE" = "release" ]; then
     cp "$SCRIPT_DIR/Resources/Info.plist" "$CONTENTS/Info.plist"
 else
-    # Dev mode: use Info-Dev.plist if it exists, otherwise fall back to Info.plist
+    # Dev and diagnostic modes: use Info-Dev.plist if it exists, otherwise fall back to Info.plist
     if [ -f "$SCRIPT_DIR/Resources/Info-Dev.plist" ]; then
         cp "$SCRIPT_DIR/Resources/Info-Dev.plist" "$CONTENTS/Info.plist"
     else
@@ -131,14 +151,12 @@ if [ -d "$METAL_SRC_DIR" ]; then
             -I "$METAL_SRC_DIR/steel/utils" \
             -I "$METAL_SRC_DIR/fft" \
             -std=metal3.1 \
-            -mmacosx-version-min=14.0 \
+            -mmacosx-version-min=15.0 \
             -o "$AIR_DIR/$BASENAME.air" 2>/dev/null
     done
 
     xcrun -sdk macosx metallib "$AIR_DIR"/*.air -o "$METALLIB_OUT" 2>/dev/null
     rm -rf "$AIR_DIR"
-    # Sign the metallib so it passes app bundle code signing
-    codesign --force --sign - "$METALLIB_OUT"
     echo "    metallib_ok ($(du -h "$METALLIB_OUT" | cut -f1 | xargs))"
 else
     echo "WARNING: MLX Metal sources not found — model inference will fail at runtime"
@@ -157,7 +175,7 @@ done
 # --- Copy audio feedback files ---
 echo "==> Copying audio files..."
 cp "$SCRIPT_DIR/Success_Sound.mp3" "$RESOURCES_DIR/"
-cp "$SCRIPT_DIR/Fail_sound.mp3" "$RESOURCES_DIR/"
+cp "$SCRIPT_DIR/Fail_sound.mov" "$RESOURCES_DIR/"
 
 # --- Embed Sparkle.framework ---
 FRAMEWORKS_DIR="$CONTENTS/Frameworks"
@@ -171,15 +189,30 @@ if [ -d "$SPARKLE_SOURCE" ]; then
     echo "==> Embedding Sparkle.framework..."
     mkdir -p "$FRAMEWORKS_DIR"
     cp -a "$SPARKLE_SOURCE" "$FRAMEWORKS_DIR/"
-    # Sign the embedded framework before signing the app
-    codesign --force --sign - "$FRAMEWORKS_DIR/Sparkle.framework"
-    echo "    sparkle_ok"
 else
     echo "WARNING: Sparkle.framework not found — app will crash on launch if it links Sparkle"
 fi
 
+# Strip extended attributes and ensure all files are writable before signing.
+# Must happen BEFORE any codesign calls — iCloud Drive adds resource-fork detritus
+# (._AppleDouble files + xattrs) that codesign rejects, and read-only SPM bundle
+# files block xattr from running.
+echo "==> Cleaning bundle attributes..."
+chmod -R u+w "$APP_BUNDLE"
+# dot_clean merges AppleDouble (._*) fork data and removes the stub files.
+dot_clean -m "$APP_BUNDLE"
+xattr -cr "$APP_BUNDLE"
+
 echo "==> Signing with ad-hoc signature..."
-codesign --force --sign - --entitlements "$ENTITLEMENTS" "$APP_BUNDLE"
+# Sign sub-components first, then the outer app bundle.
+if [ -f "$METALLIB_OUT" ]; then
+    codesign --force --sign "$SIGN_ID" "$METALLIB_OUT"
+fi
+if [ -d "$FRAMEWORKS_DIR/Sparkle.framework" ]; then
+    codesign --force --sign "$SIGN_ID" "$FRAMEWORKS_DIR/Sparkle.framework"
+    echo "    sparkle_ok"
+fi
+codesign --force --sign "$SIGN_ID" --entitlements "$ENTITLEMENTS" "$APP_BUNDLE"
 
 if [ "$MODE" = "release" ]; then
     # Release mode: create distributable .zip and sign with Sparkle EdDSA
@@ -201,10 +234,16 @@ if [ "$MODE" = "release" ]; then
     if [ -f "$SIGN_TOOL" ]; then
         echo ""
         echo "==> Signing update with Sparkle EdDSA..."
-        SIGNATURE_OUTPUT=$("$SIGN_TOOL" "$ZIP_PATH" 2>&1)
-        echo "$SIGNATURE_OUTPUT"
-        echo ""
-        echo "Copy the sparkle:edSignature and length values above into your appcast.xml"
+        # Run sign_update in a subshell so a missing keychain key doesn't abort the build.
+        SIGNATURE_OUTPUT=$("$SIGN_TOOL" "$ZIP_PATH" 2>&1) && {
+            echo "$SIGNATURE_OUTPUT"
+            echo ""
+            echo "Copy the sparkle:edSignature and length values above into your appcast.xml"
+        } || {
+            echo "WARNING: EdDSA signing failed — private key not found in Keychain."
+            echo "  To sign manually: $SIGN_TOOL $ZIP_PATH"
+            echo "  Or import the key first: $BUILD_DIR/artifacts/sparkle/Sparkle/bin/generate_keys"
+        }
     else
         echo ""
         echo "NOTE: Sparkle sign_update tool not found at $SIGN_TOOL"
@@ -219,6 +258,9 @@ if [ "$MODE" = "release" ]; then
     echo "  2. Upload $ZIP_NAME to the release"
     echo "  3. Update appcast.xml with version, signature, and download URL"
     echo "  4. Push appcast.xml to main"
+    echo ""
+    echo "IMPORTANT: You are now running the release build (com.textrefiner.app)."
+    echo "Run './build.sh' to return to the dev build before continuing development."
 else
     # Dev mode: reset TCC (ad-hoc signing = new hash each rebuild)
     #

@@ -1,9 +1,10 @@
 import CryptoKit
 import Foundation
+import Security
 
 /// Stores the last 10 refinement results on disk, encrypted.
 /// History data: ~/Library/Application Support/TextRefiner/history.json (AES-GCM encrypted)
-/// Encryption key: ~/Library/Application Support/TextRefiner/.history-key (0600 permissions)
+/// Encryption key: macOS Keychain (service: com.textrefiner.app, account: history-encryption-key)
 final class RefinementHistory {
     static let shared = RefinementHistory()
 
@@ -21,7 +22,6 @@ final class RefinementHistory {
 
     private var entries: [Entry]
     private let fileURL: URL
-    private let keyURL: URL
     private static let maxEntries = 10
 
     // MARK: - Public API
@@ -63,7 +63,6 @@ final class RefinementHistory {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let appDir = appSupport.appendingPathComponent("TextRefiner", isDirectory: true)
         self.fileURL = appDir.appendingPathComponent("history.json")
-        self.keyURL = appDir.appendingPathComponent(".history-key")
 
         try? FileManager.default.createDirectory(at: appDir, withIntermediateDirectories: true)
 
@@ -90,16 +89,92 @@ final class RefinementHistory {
 
     // MARK: - Encryption
 
+    private static let keychainService = "com.textrefiner.app"
+    private static let keychainAccount = "history-encryption-key"
+
     private func getOrCreateKey() throws -> SymmetricKey {
-        if let keyData = try? Data(contentsOf: keyURL) {
-            return SymmetricKey(data: keyData)
+        // --- One-time migration: move legacy .history-key file into Keychain ---
+        let appSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let legacyKeyURL = appSupport
+            .appendingPathComponent("TextRefiner", isDirectory: true)
+            .appendingPathComponent(".history-key")
+
+        if FileManager.default.fileExists(atPath: legacyKeyURL.path),
+           let legacyData = try? Data(contentsOf: legacyKeyURL) {
+            let status = saveKeyToKeychain(legacyData)
+            if status == errSecSuccess || status == errSecDuplicateItem {
+                try? FileManager.default.removeItem(at: legacyKeyURL)
+                return SymmetricKey(data: legacyData)
+            }
+            // Keychain write failed — fall back to file for this session
+            #if DEBUG
+            print("[TextRefiner] Keychain migration failed (\(status)), using file key as fallback")
+            #endif
+            return SymmetricKey(data: legacyData)
         }
+
+        // --- Try Data Protection Keychain first (no app-specific ACL, no password prompts) ---
+        let dpQuery: [CFString: Any] = [
+            kSecClass:                     kSecClassGenericPassword,
+            kSecAttrService:               Self.keychainService,
+            kSecAttrAccount:               Self.keychainAccount,
+            kSecUseDataProtectionKeychain: true,
+            kSecReturnData:                true,
+            kSecMatchLimit:                kSecMatchLimitOne,
+        ]
+        var dpResult: AnyObject?
+        if SecItemCopyMatching(dpQuery as CFDictionary, &dpResult) == errSecSuccess,
+           let data = dpResult as? Data {
+            return SymmetricKey(data: data)
+        }
+
+        // --- Migrate from login.keychain if present (prompts once, then moves to DP Keychain) ---
+        let legacyQuery: [CFString: Any] = [
+            kSecClass:       kSecClassGenericPassword,
+            kSecAttrService: Self.keychainService,
+            kSecAttrAccount: Self.keychainAccount,
+            kSecReturnData:  true,
+            kSecMatchLimit:  kSecMatchLimitOne,
+        ]
+        var legacyResult: AnyObject?
+        if SecItemCopyMatching(legacyQuery as CFDictionary, &legacyResult) == errSecSuccess,
+           let data = legacyResult as? Data {
+            let deleteQuery: [CFString: Any] = [
+                kSecClass:       kSecClassGenericPassword,
+                kSecAttrService: Self.keychainService,
+                kSecAttrAccount: Self.keychainAccount,
+            ]
+            SecItemDelete(deleteQuery as CFDictionary)
+            _ = saveKeyToKeychain(data)
+            return SymmetricKey(data: data)
+        }
+
+        // --- Key not found: generate a new one and store it ---
         let key = SymmetricKey(size: .bits256)
         let keyData = key.withUnsafeBytes { Data($0) }
-        try keyData.write(to: keyURL, options: .atomic)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o600], ofItemAtPath: keyURL.path)
+        let addStatus = saveKeyToKeychain(keyData)
+        guard addStatus == errSecSuccess else {
+            throw KeychainError.saveFailed(addStatus)
+        }
         return key
+    }
+
+    @discardableResult
+    private func saveKeyToKeychain(_ keyData: Data) -> OSStatus {
+        let attributes: [CFString: Any] = [
+            kSecClass:                     kSecClassGenericPassword,
+            kSecAttrService:               Self.keychainService,
+            kSecAttrAccount:               Self.keychainAccount,
+            kSecAttrAccessible:            kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+            kSecUseDataProtectionKeychain: true,
+            kSecValueData:                 keyData,
+        ]
+        return SecItemAdd(attributes as CFDictionary, nil)
+    }
+
+    private enum KeychainError: Error {
+        case saveFailed(OSStatus)
     }
 
     // MARK: - Persistence
@@ -114,7 +189,9 @@ final class RefinementHistory {
             try FileManager.default.setAttributes(
                 [.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
         } catch {
+            #if DEBUG
             print("[TextRefiner] Failed to save history.json: \(error.localizedDescription)")
+            #endif
         }
     }
 
